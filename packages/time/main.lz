@@ -1,0 +1,27 @@
+# time - time and duration helpers (built on the time()/clock() builtins).
+#
+#   import "time" as time
+#   let start = time.stopwatch(); ...; print(time.elapsed(start))
+#   print(time.humanize(93784))     # "1d 2h 3m 4s"
+
+fn now() { return time() }
+fn stopwatch() { return clock() }
+fn elapsed(start) { return clock() - start }
+
+fn humanize(secs) {
+  let s = int(secs)
+  if s < 0 { return "-" + humanize(-s) }
+  let parts = []
+  let d = s // 86400
+  if d > 0 { parts.push(str(d) + "d"); s = s % 86400 }
+  let h = s // 3600
+  if h > 0 { parts.push(str(h) + "h"); s = s % 3600 }
+  let m = s // 60
+  if m > 0 { parts.push(str(m) + "m"); s = s % 60 }
+  if s > 0 or len(parts) == 0 { parts.push(str(s) + "s") }
+  return join(parts, " ")
+}
+
+fn _q(s) { return "'" + str(s).replace("'", "") + "'" }
+# Format a unix timestamp using the system `date` (strftime-style format).
+fn format(ts, fmt) { return capture("date -d @" + str(int(ts)) + " +" + _q(fmt)).strip() }

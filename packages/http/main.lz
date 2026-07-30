@@ -1,0 +1,44 @@
+# http - a simple HTTP client for Larzscript, built on curl.
+#
+#   import "http" as http
+#   let body = http.get("https://example.com")
+#   let code = http.status("https://example.com")     # 200
+#   http.download("https://.../file.zip", "file.zip")
+#
+# Pairs well with the json package:
+#   import "json" as json
+#   let data = json.parse(http.get("https://api.example.com/thing"))
+
+# Crude but effective shell-quoting: wrap in single quotes, drop any single
+# quotes from the input (URLs and simple bodies don't contain them).
+fn _q(s) { return "'" + str(s).replace("'", "") + "'" }
+
+# GET the body of a URL (follows redirects, fails on HTTP errors).
+fn get(url) { return capture("curl -fsSL " + _q(url)) }
+
+# GET, or return the fallback string if the request fails.
+fn get_or(url, fallback) {
+  let out = capture("curl -fsSL " + _q(url) + " 2>/dev/null")
+  return out == "" ? fallback : out
+}
+
+# POST a body, return the response body.
+fn post(url, body) {
+  return capture("curl -fsSL -X POST --data " + _q(body) + " " + _q(url))
+}
+
+# POST a body with a Content-Type header (e.g. "application/json").
+fn post_with(url, body, content_type) {
+  return capture("curl -fsSL -X POST -H " + _q("Content-Type: " + content_type) +
+                 " --data " + _q(body) + " " + _q(url))
+}
+
+# The HTTP status code for a URL (e.g. 200, 404), as a number.
+fn status(url) {
+  return int(capture("curl -fsS -o /dev/null -w '%{http_code}' " + _q(url)).strip())
+}
+
+# Download a URL to a file. Returns true on success.
+fn download(url, path) {
+  return run("curl -fsSL " + _q(url) + " -o " + _q(path)) == 0
+}

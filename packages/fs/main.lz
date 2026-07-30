@@ -1,0 +1,24 @@
+# fs - filesystem helpers (built on the OS builtins).
+#
+#   import "fs" as fs
+#   fs.write("out.txt", "hi"); print(fs.read("out.txt"))
+#   for name in fs.ls(".") { print(name) }
+
+fn _q(s) { return "'" + str(s).replace("'", "") + "'" }
+
+fn read(path) { return read_file(path) }
+fn write(path, content) { write_file(path, content); return true }
+fn append(path, content) { append_file(path, content); return true }
+fn exists(path) { return file_exists(path) }
+fn lines(path) { return read_file(path).split("\n") }
+fn ls(path=".") { return sorted(listdir(path)) }
+fn mkdirs(path) { return run("mkdir -p " + _q(path)) == 0 }
+fn copy(src, dst) { return run("cp -r " + _q(src) + " " + _q(dst)) == 0 }
+fn move(src, dst) { return rename(src, dst) }
+fn rm(path) { return run("rm -rf " + _q(path)) == 0 }
+fn basename(path) { let parts = path.split("/"); return parts[len(parts) - 1] }
+fn dirname(path) {
+  let parts = path.split("/")
+  if len(parts) <= 1 { return "." }
+  return join(parts[:len(parts) - 1], "/")
+}
