@@ -47,6 +47,12 @@ larzscript larzpkg.lz install mathx
 | [password_strength](packages/password_strength) | password strength scoring |
 | [totp](packages/totp) | RFC 6238 one-time codes (HMAC-SHA256) |
 | [jwt](packages/jwt) | signed JSON tokens (HS256) |
+| [uuid](packages/uuid) | RFC 4122 v4 UUID generation |
+| [yaml](packages/yaml) | lightweight YAML-subset parse/stringify |
+| [diff](packages/diff) | line-based diff between two strings |
+| [budget](packages/budget) | category-based budget tracking |
+| [tax](packages/tax) | flat and progressive-bracket tax calculators |
+| [fetch](packages/fetch) | real HTTP GET from the shell (kernel-only) |
 
 ## Adding a package
 
