@@ -60,6 +60,13 @@ larzscript larzpkg.lz install mathx
 | [queue](packages/queue) | a FIFO queue |
 | [stats](packages/stats) | mean/median/mode/stddev/percentile |
 | [template](packages/template) | {{var}} string templating - loops, conditionals |
+| [slugify](packages/slugify) | clean URL slugs from text |
+| [case](packages/case) | camelCase/PascalCase/kebab-case converters |
+| [url](packages/url) | URL parse/build + query-string encode/decode |
+| [semver](packages/semver) | semantic version parse/compare/satisfies |
+| [mime](packages/mime) | MIME type lookup by file extension |
+| [duration](packages/duration) | parse "1d2h3m4s"-style durations to/from seconds |
+| [luhn](packages/luhn) | Luhn checksum validation + check-digit generation |
 
 ## Adding a package
 
