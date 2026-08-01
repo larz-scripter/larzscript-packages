@@ -9,9 +9,12 @@
 #   import "json" as json
 #   let data = json.parse(http.get("https://api.example.com/thing"))
 
-# Crude but effective shell-quoting: wrap in single quotes, drop any single
-# quotes from the input (URLs and simple bodies don't contain them).
-fn _q(s) { return "'" + str(s).replace("'", "") + "'" }
+# Proper POSIX single-quote shell-escaping: wrap in single quotes, and for
+# any single quote IN the input, close the quote, emit an escaped literal
+# quote, reopen the quote ('\''). Previously this dropped single quotes
+# instead of escaping them, silently corrupting any body/URL containing one
+# (e.g. real prose - "it's", "Larzscript's" - posted as a JSON body).
+fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
 
 # GET the body of a URL (follows redirects, fails on HTTP errors).
 fn get(url) { return capture("curl -fsSL " + _q(url)) }

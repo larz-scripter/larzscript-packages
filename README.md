@@ -53,6 +53,7 @@ larzscript larzpkg.lz install mathx
 | [budget](packages/budget) | category-based budget tracking |
 | [tax](packages/tax) | flat and progressive-bracket tax calculators |
 | [fetch](packages/fetch) | real HTTP GET from the shell (kernel-only) |
+| [regex](packages/regex) | pattern matching - literals, classes, quantifiers, anchors |
 
 ## Adding a package
 
