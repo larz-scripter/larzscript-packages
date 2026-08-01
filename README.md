@@ -54,6 +54,12 @@ larzscript larzpkg.lz install mathx
 | [tax](packages/tax) | flat and progressive-bracket tax calculators |
 | [fetch](packages/fetch) | real HTTP GET from the shell (kernel-only) |
 | [regex](packages/regex) | pattern matching - literals, classes, quantifiers, anchors |
+| [markdown](packages/markdown) | Markdown-to-HTML, built on regex + html |
+| [set](packages/set) | a real set type - union/intersect/difference |
+| [stack](packages/stack) | a LIFO stack |
+| [queue](packages/queue) | a FIFO queue |
+| [stats](packages/stats) | mean/median/mode/stddev/percentile |
+| [template](packages/template) | {{var}} string templating - loops, conditionals |
 
 ## Adding a package
 
