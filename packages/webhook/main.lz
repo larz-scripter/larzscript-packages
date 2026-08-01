@@ -1,0 +1,13 @@
+# webhook - sign and verify webhook payloads with HMAC-SHA256 (via the
+# `crypto` package) - the same shape real payment/webhook providers use
+# (e.g. an `X-Signature: HMAC-SHA256(secret, body)` header).
+#
+#   import "webhook" as webhook
+#   let sig = webhook.sign(body, secret)                 # send as a header
+#   if webhook.verify(body, received_sig, secret) { ... } # on the receiving end
+
+import "crypto" as crypto
+
+fn sign(payload, secret) { return crypto.hmac(secret, payload) }
+
+fn verify(payload, signature, secret) { return sign(payload, secret) == signature }

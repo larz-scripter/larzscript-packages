@@ -1,0 +1,31 @@
+# apikey - generate and verify opaque API keys for Larzscript SaaS scripts.
+# Store `hash(key)`, never the raw key - same discipline `auth.lz` already
+# uses for passwords, upgraded to real SHA-256 (via `crypto`) instead of a
+# demo checksum. ⚠ `generate()`'s randomness is seeded from the monotonic
+# clock, not a real OS entropy source - fine for dev/demo API keys, NOT a
+# substitute for a true CSPRNG if you need production-grade secrets.
+#
+#   import "apikey" as apikey
+#   let key = apikey.generate("sk")        # "sk_..." - show this to the user ONCE
+#   let stored = apikey.hash(key)          # persist only this
+#   apikey.verify(supplied_key, stored)    # true/false, on every request
+
+import "crypto" as crypto
+import "random" as rng
+
+let _CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+fn generate(prefix="") {
+  rng.seed(int(clock() * 1000000) % 2147483646 + 1)
+  let key = ""
+  let i = 0
+  while i < 32 {
+    key = key + _CHARS[rng.randint(0, len(_CHARS) - 1)]
+    i = i + 1
+  }
+  return prefix == "" ? key : prefix + "_" + key
+}
+
+fn hash(key) { return crypto.sha256(key) }
+
+fn verify(key, stored_hash) { return hash(key) == stored_hash }

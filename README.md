@@ -29,6 +29,17 @@ larzscript larzpkg.lz install mathx
 | [log](packages/log) | leveled logging with timestamps |
 | [cli](packages/cli) | build CLI tools with subcommands |
 | [html](packages/html) | build HTML with auto-escaping |
+| [crypto](packages/crypto) | real SHA-256 + HMAC-SHA256, pure Larzscript |
+| [webhook](packages/webhook) | sign/verify webhook payloads (HMAC-SHA256) |
+| [apikey](packages/apikey) | generate/hash/verify opaque API keys |
+| [ratelimit](packages/ratelimit) | token-bucket rate limiting |
+| [invoice](packages/invoice) | build/format invoices from Money line items |
+| [escrow](packages/escrow) | hold/release/refund on top of wallet/pay |
+| [fx](packages/fx) | currency conversion with a settable rate table |
+| [loan](packages/loan) | interest + amortization calculations |
+| [markov](packages/markov) | Markov-chain text generation |
+| [sentiment](packages/sentiment) | lexicon-based sentiment scoring |
+| [ai](packages/ai) | pluggable LLM client, wallet-gated metered calls |
 
 ## Adding a package
 

@@ -42,3 +42,11 @@ fn status(url) {
 fn download(url, path) {
   return run("curl -fsSL " + _q(url) + " -o " + _q(path)) == 0
 }
+
+# POST a body with arbitrary headers (a dict of name->value) - e.g. an
+# Authorization/x-api-key header post_with() has no way to set.
+fn post_headers(url, body, headers) {
+  let hflags = ""
+  for k in keys(headers) { hflags = hflags + " -H " + _q(k + ": " + headers[k]) }
+  return capture("curl -fsSL -X POST" + hflags + " --data " + _q(body) + " " + _q(url))
+}

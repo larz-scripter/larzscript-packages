@@ -1,0 +1,44 @@
+# ai - a generic, pluggable LLM HTTP client for Larzscript (hosted/native
+# only - needs curl, doesn't run on the bare-metal kernel, same tier as the
+# `http` package it's built on). No endpoint/key is ever hardcoded - point
+# it at your own gateway or any OpenAI-compatible endpoint via env vars:
+#   LARZSCRIPT_AI_URL    - full chat-completions endpoint URL
+#   LARZSCRIPT_AI_KEY    - bearer/API key (sent as "Authorization: Bearer ...")
+#   LARZSCRIPT_AI_MODEL  - model name (optional, default "gpt-4o-mini")
+# Default request/response shape is OpenAI-style chat completions
+# (POST {model, messages:[{role,content}]} -> {choices:[{message:{content}}]})
+# - the most common shape gateways speak.
+#
+#   import "ai" as ai
+#   print(ai.ask("summarize: the quick brown fox jumps over the lazy dog"))
+#
+# THE MONEY-NATIVE PART - an AI call as a real metered transaction, not just
+# an API wrapper: ask_paid() pays from the caller's wallet BEFORE calling
+# out, using this language's own `pay`/`wallet` keywords, so a declined
+# payment means the call never happens.
+#   wallet user = $5.00
+#   wallet api_revenue
+#   price per_call = $0.02
+#   print(ai.ask_paid("hello", user, api_revenue, per_call))
+
+import "http" as http
+import "json" as json
+
+fn ask(prompt) {
+  let url = env("LARZSCRIPT_AI_URL", "")
+  if url == "" {
+    throw {"type": "AiError", "message": "set LARZSCRIPT_AI_URL (and LARZSCRIPT_AI_KEY) first"}
+  }
+  let key = env("LARZSCRIPT_AI_KEY", "")
+  let model = env("LARZSCRIPT_AI_MODEL", "gpt-4o-mini")
+  let body = json.stringify({"model": model, "messages": [{"role": "user", "content": prompt}]})
+  let headers = {"Content-Type": "application/json"}
+  if key != "" { headers["Authorization"] = "Bearer " + key }
+  let data = json.parse(http.post_headers(url, body, headers))
+  return data["choices"][0]["message"]["content"]
+}
+
+fn ask_paid(prompt, wallet_from, wallet_to, unit_price) {
+  pay unit_price from wallet_from to wallet_to
+  return ask(prompt)
+}

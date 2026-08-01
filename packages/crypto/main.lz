@@ -1,0 +1,210 @@
+# crypto - real SHA-256 + HMAC-SHA256, in pure Larzscript (FIPS 180-4,
+# ported from the same implementation that backs `larzscript update`'s
+# release-integrity check). No bitwise operators exist in this language, so
+# AND/XOR are done bit-by-bit; rotation is done with pure arithmetic
+# (non-overlapping halves, so addition substitutes for OR - no bit-loop
+# needed there). Fine for short inputs (API keys, webhook payloads, tokens)
+# - not built for hashing megabytes.
+#
+#   import "crypto" as crypto
+#   crypto.sha256("abc")            # "ba7816bf..."
+#   crypto.hmac("secret", "body")   # HMAC-SHA256 hex digest
+#
+# Runs its own self-test (the 2 standard NIST vectors) at import time and
+# throws if the hash routine is ever wrong - never trust a silently-broken
+# hash for anything security-sensitive.
+
+let _POW2 = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+             16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152,
+             4194304, 8388608, 16777216, 33554432, 67108864, 134217728,
+             268435456, 536870912, 1073741824, 2147483648, 4294967296]
+
+fn _band(a, b) {
+  let r = 0
+  let x = a
+  let y = b
+  let i = 0
+  while i < 32 {
+    if (x % 2 == 1) and (y % 2 == 1) { r = r + _POW2[i] }
+    x = x // 2
+    y = y // 2
+    i = i + 1
+  }
+  return r
+}
+
+fn _bxor(a, b) {
+  let r = 0
+  let x = a
+  let y = b
+  let i = 0
+  while i < 32 {
+    if (x % 2) != (y % 2) { r = r + _POW2[i] }
+    x = x // 2
+    y = y // 2
+    i = i + 1
+  }
+  return r
+}
+
+fn _rotr(x, n) {
+  let hi = x // _POW2[n]
+  let lo = (x % _POW2[n]) * _POW2[32 - n]
+  return hi + lo
+}
+
+let _K = [1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993,
+  2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987,
+  1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774,
+  264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+  2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711,
+  113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291,
+  1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411,
+  3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+  430227734, 506948616, 659060556, 883997877, 958139571, 1322822218,
+  1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424,
+  2428436474, 2756734187, 3204031479, 3329325298]
+
+let _H0 = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119,
+           2600822924, 528734635, 1541459225]
+
+fn _bytes(s) {
+  let out = []
+  for c in s { out.push(ord(c)) }
+  return out
+}
+
+let _HEXCH = "0123456789abcdef"
+fn _hex(bytes_) {
+  let out = ""
+  for byte in bytes_ { out = out + _HEXCH[byte // 16] + _HEXCH[byte % 16] }
+  return out
+}
+
+fn _pad(bytes_) {
+  let msg = list(bytes_)
+  let bitlen = len(bytes_) * 8
+  msg.push(128)
+  while len(msg) % 64 != 56 { msg.push(0) }
+  let lenbytes = [0, 0, 0, 0, 0, 0, 0, 0]
+  let bl = bitlen
+  let k = 7
+  while k >= 0 { lenbytes[k] = bl % 256; bl = bl // 256; k = k - 1 }
+  for b in lenbytes { msg.push(b) }
+  return msg
+}
+
+fn _schedule(block) {
+  let w = [0 for _ in range(64)]
+  let i = 0
+  while i < 16 {
+    let j = i * 4
+    w[i] = block[j] * 16777216 + block[j + 1] * 65536 + block[j + 2] * 256 + block[j + 3]
+    i = i + 1
+  }
+  i = 16
+  while i < 64 {
+    let s0 = _bxor(_bxor(_rotr(w[i - 15], 7), _rotr(w[i - 15], 18)), w[i - 15] // 8)
+    let s1 = _bxor(_bxor(_rotr(w[i - 2], 17), _rotr(w[i - 2], 19)), w[i - 2] // 1024)
+    w[i] = (w[i - 16] + s0 + w[i - 7] + s1) % 4294967296
+    i = i + 1
+  }
+  return w
+}
+
+fn _compress(state, w) {
+  let a = state[0]
+  let b = state[1]
+  let c = state[2]
+  let d = state[3]
+  let e = state[4]
+  let f = state[5]
+  let g = state[6]
+  let h = state[7]
+  let i = 0
+  while i < 64 {
+    let S1 = _bxor(_bxor(_rotr(e, 6), _rotr(e, 11)), _rotr(e, 25))
+    let ch = _bxor(_band(e, f), _band(4294967295 - e, g))
+    let t1 = (h + S1 + ch + _K[i] + w[i]) % 4294967296
+    let S0 = _bxor(_bxor(_rotr(a, 2), _rotr(a, 13)), _rotr(a, 22))
+    let maj = _bxor(_bxor(_band(a, b), _band(a, c)), _band(b, c))
+    let t2 = (S0 + maj) % 4294967296
+    h = g
+    g = f
+    f = e
+    e = (d + t1) % 4294967296
+    d = c
+    c = b
+    b = a
+    a = (t1 + t2) % 4294967296
+    i = i + 1
+  }
+  state[0] = (state[0] + a) % 4294967296
+  state[1] = (state[1] + b) % 4294967296
+  state[2] = (state[2] + c) % 4294967296
+  state[3] = (state[3] + d) % 4294967296
+  state[4] = (state[4] + e) % 4294967296
+  state[5] = (state[5] + f) % 4294967296
+  state[6] = (state[6] + g) % 4294967296
+  state[7] = (state[7] + h) % 4294967296
+}
+
+fn _sha256_bytes(msg_bytes) {
+  let padded = _pad(msg_bytes)
+  let state = list(_H0)
+  let nblocks = len(padded) // 64
+  let bi = 0
+  while bi < nblocks {
+    let block = padded[bi * 64:bi * 64 + 64]
+    _compress(state, _schedule(block))
+    bi = bi + 1
+  }
+  let out = []
+  for word in state {
+    out.push((word // 16777216) % 256)
+    out.push((word // 65536) % 256)
+    out.push((word // 256) % 256)
+    out.push(word % 256)
+  }
+  return out
+}
+
+# SHA-256 of a string, as a 64-char lowercase hex digest.
+fn sha256(text) { return _hex(_sha256_bytes(_bytes(text))) }
+
+fn _hmac_bytes(key_bytes, msg_bytes) {
+  let block_size = 64
+  let key = key_bytes
+  if len(key) > block_size { key = _sha256_bytes(key) }
+  if len(key) < block_size {
+    let padded = list(key)
+    while len(padded) < block_size { padded.push(0) }
+    key = padded
+  }
+  let ipad = []
+  let opad = []
+  let i = 0
+  while i < block_size {
+    ipad.push(_bxor(key[i], 54))
+    opad.push(_bxor(key[i], 92))
+    i = i + 1
+  }
+  let inner_input = list(ipad)
+  inner_input.extend(msg_bytes)
+  let inner = _sha256_bytes(inner_input)
+  let outer_input = list(opad)
+  outer_input.extend(inner)
+  return _sha256_bytes(outer_input)
+}
+
+# HMAC-SHA256(key, msg), as a 64-char lowercase hex digest.
+fn hmac(key, msg) { return _hex(_hmac_bytes(_bytes(key), _bytes(msg))) }
+
+fn _selftest() {
+  return sha256("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" and
+         sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+}
+
+if not _selftest() {
+  throw {"type": "CryptoError", "message": "crypto: SHA-256 self-test failed - do not trust this module"}
+}
