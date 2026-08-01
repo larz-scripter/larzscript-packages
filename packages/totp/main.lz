@@ -1,0 +1,50 @@
+# totp - RFC 6238 time-based one-time codes, HMAC-SHA256 variant (many
+# authenticator apps support `algorithm=SHA256`, not just the original
+# SHA-1 default - this package only implements SHA-256, via `crypto`).
+# Hosted-only (needs `crypto`, which the kernel's 8MB heap can't sustain).
+#
+#   import "totp" as totp
+#   let code = totp.generate(secret)      # 6-digit code for "now"
+#   totp.verify(secret, code)             # checks a +/-1 step drift window
+
+import "crypto" as crypto
+
+# A raw 8-byte big-endian counter, as a byte LIST (not a string - a string
+# built via chr(0) concatenation silently truncates at the leading zero
+# bytes in this language; see crypto.hmac_raw()'s note).
+fn _counter_bytes(counter) {
+  let out = [0, 0, 0, 0, 0, 0, 0, 0]
+  let k = 7
+  let c = counter
+  while k >= 0 { out[k] = c % 256; c = c // 256; k = k - 1 }
+  return out
+}
+
+fn _hotp(secret, counter, digits) {
+  let mac = crypto.hmac_raw(crypto.str_to_bytes(secret), _counter_bytes(counter))
+  let offset = mac[31] % 16
+  let bin_code = (mac[offset] % 128) * 16777216 + mac[offset + 1] * 65536 +
+                 mac[offset + 2] * 256 + mac[offset + 3]
+  let mod = 1
+  let i = 0
+  while i < digits { mod = mod * 10; i = i + 1 }
+  let code = bin_code % mod
+  let s = str(code)
+  while len(s) < digits { s = "0" + s }
+  return s
+}
+
+fn generate(secret, step_seconds=30, digits=6) {
+  let counter = int(time() // step_seconds)
+  return _hotp(secret, counter, digits)
+}
+
+fn verify(secret, code, step_seconds=30, digits=6, window=1) {
+  let counter = int(time() // step_seconds)
+  let w = -window
+  while w <= window {
+    if _hotp(secret, counter + w, digits) == code { return true }
+    w = w + 1
+  }
+  return false
+}

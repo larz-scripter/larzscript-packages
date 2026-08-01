@@ -200,6 +200,48 @@ fn _hmac_bytes(key_bytes, msg_bytes) {
 # HMAC-SHA256(key, msg), as a 64-char lowercase hex digest.
 fn hmac(key, msg) { return _hex(_hmac_bytes(_bytes(key), _bytes(msg))) }
 
+# HMAC-SHA256(key, msg), as raw bytes (a list of 32 ints 0-255) - for
+# callers that need the bytes directly (dynamic truncation, base64, ...)
+# instead of a hex string.
+fn hmac_bytes(key, msg) { return _hmac_bytes(_bytes(key), _bytes(msg)) }
+
+# Like hmac_bytes(), but both key and msg are ALREADY byte lists (list of
+# ints 0-255), not strings. Needed for anything with raw binary content
+# that includes zero bytes: this language's strings are C-style
+# NUL-terminated (`len`/`+`/`for..in` all measure via strlen()), so a zero
+# byte silently truncates whatever comes after it if you build binary data
+# by concatenating strings with chr(0) - found the hard way (pbkdf2's
+# INT(i) counter has leading zero bytes). Byte LISTS have no such problem.
+fn hmac_raw(key_bytes, msg_bytes) { return _hmac_bytes(key_bytes, msg_bytes) }
+
+# A string's raw bytes as a list of ints 0-255 (only safe for strings
+# without embedded NUL bytes - see hmac_raw()'s note).
+fn str_to_bytes(s) { return _bytes(s) }
+
+# PBKDF2-HMAC-SHA256 (RFC 8018), fixed at a 32-byte (single-block) derived
+# key - the common case for "give me a 256-bit key from a password". Returns
+# a 64-char lowercase hex digest. ⚠ each iteration costs a full HMAC-SHA256
+# call, and this tree-walking interpreter's per-call overhead makes that
+# roughly half a second EACH (measured) - a real production iteration count
+# (100,000+, per OWASP) would take many hours here. Fine for correctness/
+# education or a handful of iterations as light password stretching; not a
+# substitute for a fast native KDF if you need real brute-force resistance.
+fn pbkdf2(password, salt, iterations) {
+  let salt_bytes = _bytes(salt)
+  salt_bytes.extend([0, 0, 0, 1])
+  let pw_bytes = _bytes(password)
+  let u = _hmac_bytes(pw_bytes, salt_bytes)
+  let result = list(u)
+  let k = 1
+  while k < iterations {
+    u = _hmac_bytes(pw_bytes, u)
+    let j = 0
+    while j < 32 { result[j] = _bxor(result[j], u[j]); j = j + 1 }
+    k = k + 1
+  }
+  return _hex(result)
+}
+
 fn _selftest() {
   return sha256("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" and
          sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"

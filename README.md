@@ -40,6 +40,13 @@ larzscript larzpkg.lz install mathx
 | [markov](packages/markov) | Markov-chain text generation |
 | [sentiment](packages/sentiment) | lexicon-based sentiment scoring |
 | [ai](packages/ai) | pluggable LLM client, wallet-gated metered calls |
+| [net](packages/net) | LarzOS's own real networking (kernel-only) |
+| [ip](packages/ip) | IPv4 parse/validate/CIDR matching |
+| [acl](packages/acl) | IP allow/deny access control lists |
+| [validate](packages/validate) | email/URL/path-traversal/SQLi/XSS checks |
+| [password_strength](packages/password_strength) | password strength scoring |
+| [totp](packages/totp) | RFC 6238 one-time codes (HMAC-SHA256) |
+| [jwt](packages/jwt) | signed JSON tokens (HS256) |
 
 ## Adding a package
 

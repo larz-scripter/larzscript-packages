@@ -1,0 +1,41 @@
+# jwt - signed JSON tokens (header.payload.signature, base64url), via
+# `crypto.hmac_bytes` + `json` + `base64`. Hosted-only (needs `crypto`).
+#
+#   import "jwt" as jwt
+#   let token = jwt.sign({"sub": "user1", "exp": time() + 3600}, "secret")
+#   let payload = jwt.verify(token, "secret")   # the dict, or throws
+
+import "crypto" as crypto
+import "json" as json
+import "base64" as base64
+
+fn _b64url(s) { return base64.encode(s).replace("+", "-").replace("/", "_").replace("=", "") }
+
+fn _b64url_decode(s) {
+  let padded = s.replace("-", "+").replace("_", "/")
+  while len(padded) % 4 != 0 { padded = padded + "=" }
+  return base64.decode(padded)
+}
+
+fn _bytes_to_str(bytes_) {
+  let out = ""
+  for b in bytes_ { out = out + chr(b) }
+  return out
+}
+
+fn sign(payload, secret) {
+  let header = _b64url(json.stringify({"alg": "HS256", "typ": "JWT"}))
+  let body = _b64url(json.stringify(payload))
+  let signing_input = header + "." + body
+  let sig = _b64url(_bytes_to_str(crypto.hmac_bytes(secret, signing_input)))
+  return signing_input + "." + sig
+}
+
+fn verify(token, secret) {
+  let parts = token.split(".")
+  if len(parts) != 3 { throw {"type": "JwtError", "message": "malformed token"} }
+  let signing_input = parts[0] + "." + parts[1]
+  let expected = _b64url(_bytes_to_str(crypto.hmac_bytes(secret, signing_input)))
+  if expected != parts[2] { throw {"type": "JwtError", "message": "invalid signature"} }
+  return json.parse(_b64url_decode(parts[1]))
+}
