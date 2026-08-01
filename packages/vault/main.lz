@@ -1,0 +1,121 @@
+# vault - password-based authenticated encryption with atomic file
+# saves. Key derivation is PBKDF2-HMAC-SHA256, not scrypt: Larzscript
+# has no memory-hard KDF primitive and building one from scratch is a
+# much larger undertaking than this package's scope - `crypto.pbkdf2`
+# already exists, is a real (if not memory-hard) NIST-standard KDF, and
+# is used here instead of overclaiming scrypt. Encryption is a real
+# encrypt-then-MAC construction: an HMAC-SHA256-counter-mode keystream
+# (there's no AES in this estate's crypto package either) XORed with the
+# plaintext, then a separate HMAC-SHA256 authenticates the ciphertext
+# together with the caller's AAD - so ciphertext moved into a different
+# context (a different AAD) fails to authenticate, the "downgrade-proof"
+# property. Saves are atomic: written to a temp file, then rename()'d
+# into place, so a crash mid-write never leaves a half-written vault.
+#
+#   import "vault" as vault
+#   let v = vault.encrypt("secret data", "my-password", "app-v1")
+#   vault.save(v, "data.vault")
+#   let loaded = vault.load("data.vault")
+#   print(vault.decrypt(loaded, "my-password", "app-v1"))   # "secret data"
+#   print(vault.decrypt(loaded, "my-password", "app-v2"))   # throws - AAD mismatch
+
+import "crypto" as crypto
+import "json" as json
+import "uuid" as uuid
+
+let _HEXCH = "0123456789abcdef"
+fn _to_hex(bytes_) {
+  let out = ""
+  for b in bytes_ { out = out + _HEXCH[b // 16:b // 16 + 1] + _HEXCH[b % 16:b % 16 + 1] }
+  return out
+}
+fn _from_hex(hex_str) {
+  let out = []
+  let i = 0
+  while i < len(hex_str) {
+    out.push(_HEXCH.find(hex_str[i:i+1]) * 16 + _HEXCH.find(hex_str[i+1:i+2]))
+    i = i + 2
+  }
+  return out
+}
+fn _xor_bytes(a, b) {
+  let out = []
+  let i = 0
+  while i < len(a) {
+    let x = a[i]
+    let y = b[i]
+    let r = 0
+    let place = 1
+    let k = 0
+    while k < 8 {
+      if x % 2 != y % 2 { r = r + place }
+      x = x // 2
+      y = y // 2
+      place = place * 2
+      k = k + 1
+    }
+    out.push(r)
+    i = i + 1
+  }
+  return out
+}
+
+# HMAC-SHA256 counter-mode keystream, `n` bytes: block_i = HMAC(key, i),
+# blocks concatenated and truncated to n.
+fn _keystream(key_hex, n) {
+  let out = []
+  let counter = 0
+  while len(out) < n {
+    for b in crypto.hmac_bytes(key_hex, str(counter)) { out.push(b) }
+    counter = counter + 1
+  }
+  return out[0:n]
+}
+
+fn _secure_equal(a, b) {
+  let n = len(a) > len(b) ? len(a) : len(b)
+  let diff = len(a) != len(b) ? 1 : 0
+  let i = 0
+  while i < n {
+    let ca = i < len(a) ? a[i:i+1] : ""
+    let cb = i < len(b) ? b[i:i+1] : ""
+    if ca != cb { diff = 1 }
+    i = i + 1
+  }
+  return diff == 0
+}
+
+fn encrypt(plaintext, password, aad="", iterations=10) {
+  let salt = uuid.v4()
+  let master = crypto.pbkdf2(password, salt, iterations)
+  let key_enc = crypto.hmac(master, "enc")
+  let key_mac = crypto.hmac(master, "mac")
+  let plain_bytes = crypto.str_to_bytes(plaintext)
+  let ciphertext_bytes = _xor_bytes(plain_bytes, _keystream(key_enc, len(plain_bytes)))
+  let ciphertext_hex = _to_hex(ciphertext_bytes)
+  let mac = crypto.hmac(key_mac, ciphertext_hex + "|" + aad)
+  return {"salt": salt, "iterations": iterations, "aad": aad, "ciphertext": ciphertext_hex, "mac": mac}
+}
+
+fn decrypt(v, password, aad="") {
+  let master = crypto.pbkdf2(password, v["salt"], v["iterations"])
+  let key_mac = crypto.hmac(master, "mac")
+  let expected_mac = crypto.hmac(key_mac, v["ciphertext"] + "|" + aad)
+  if not _secure_equal(expected_mac, v["mac"]) {
+    throw {"type": "LarzVaultAuthError", "message": "wrong password, tampered ciphertext, or AAD mismatch"}
+  }
+  let key_enc = crypto.hmac(master, "enc")
+  let ciphertext_bytes = _from_hex(v["ciphertext"])
+  let plain_bytes = _xor_bytes(ciphertext_bytes, _keystream(key_enc, len(ciphertext_bytes)))
+  let out = ""
+  for b in plain_bytes { out = out + chr(b) }
+  return out
+}
+
+fn save(v, path) {
+  let tmp = path + ".tmp"
+  write_file(tmp, json.stringify(v))
+  rename(tmp, path)
+}
+
+fn load(path) { return json.parse(read_file(path)) }

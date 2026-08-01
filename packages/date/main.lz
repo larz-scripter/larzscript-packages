@@ -1,0 +1,79 @@
+# date - calendar-math primitives with the algorithms in plain view:
+# leap years, days-in-month, day-of-week, day arithmetic, and a
+# month calendar grid. Deliberately not a datetime object - shows how
+# Howard Hinnant's days_from_civil/civil_from_days actually work, the
+# same pair of functions this whole estate's other date-handling code
+# (kernel time.lz, larzcron) is built on.
+#
+#   import "date" as date
+#   print(date.is_leap_year(2024))          # true
+#   print(date.days_in_month(2024, 2))       # 29
+#   print(date.day_of_week(2026, 8, 1))      # 6 (Saturday, Sun=0)
+#   print(date.days_between(2026, 1, 1, 2026, 8, 1))
+#   print(date.add_days(2026, 1, 1, 213))
+
+fn is_leap_year(y) { return (y % 4 == 0 and y % 100 != 0) or y % 400 == 0 }
+
+let _DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+fn days_in_month(y, m) {
+  if m == 2 and is_leap_year(y) { return 29 }
+  return _DAYS_IN_MONTH[m - 1]
+}
+
+# Hinnant's days_from_civil: {y, m, d} -> days since 1970-01-01.
+fn days_from_civil(y, m, d) {
+  y = m <= 2 ? y - 1 : y
+  let era = (y >= 0 ? y : y - 399) // 400
+  let yoe = y - era * 400
+  let mp = (m + 9) % 12
+  let doy = (153 * mp + 2) // 5 + d - 1
+  let doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+  return era * 146097 + doe - 719468
+}
+
+# The inverse: days since epoch -> {y, m, d}.
+fn civil_from_days(z) {
+  z = z + 719468
+  let era = (z >= 0 ? z : z - 146096) // 146097
+  let doe = z - era * 146097
+  let yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+  let y = yoe + era * 400
+  let doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+  let mp = (5 * doy + 2) // 153
+  let d = doy - (153 * mp + 2) // 5 + 1
+  let m = mp + (mp < 10 ? 3 : -9)
+  y = y + (m <= 2 ? 1 : 0)
+  return {"y": y, "m": m, "d": d}
+}
+
+fn day_of_week(y, m, d) {
+  let days = days_from_civil(y, m, d)
+  return ((days + 4) % 7 + 7) % 7
+}
+
+fn add_days(y, m, d, n) {
+  return civil_from_days(days_from_civil(y, m, d) + n)
+}
+
+fn days_between(y1, m1, d1, y2, m2, d2) {
+  return days_from_civil(y2, m2, d2) - days_from_civil(y1, m1, d1)
+}
+
+let _WEEKDAY_NAMES = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+
+# A printable grid for the given month, weeks as rows, blank cells as "".
+fn month_calendar(y, m) {
+  let first_wd = day_of_week(y, m, 1)
+  let ndays = days_in_month(y, m)
+  let cells = []
+  for _ in range(first_wd) { cells.push("") }
+  for day in range(1, ndays + 1) { cells.push(day) }
+  while len(cells) % 7 != 0 { cells.push("") }
+  let weeks = []
+  let i = 0
+  while i < len(cells) {
+    weeks.push(cells[i:i+7])
+    i = i + 7
+  }
+  return {"weekday_names": _WEEKDAY_NAMES, "weeks": weeks}
+}

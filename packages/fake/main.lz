@@ -1,0 +1,64 @@
+# fake - fake data for tests, demos, and DB seeding: names, emails,
+# sentences, numbers, dates. Deterministic when you seed() it - same
+# seed, same sequence, every time, so a test suite that generates fake
+# fixtures still gets reproducible failures.
+#
+#   import "fake" as fake
+#   fake.seed(42)
+#   print(fake.name())          # "Ivy Foster"
+#   print(fake.email())          # "ivy.foster42@example.com"
+#   print(fake.sentence(6))
+#   print(fake.number(1, 100))
+#   print(fake.date(2020, 2026))
+
+import "random" as rng
+import "date" as date_lib
+
+fn seed(n) { rng.seed(n) }
+
+let _FIRST = ["Ada", "Bo", "Cy", "Dee", "Eli", "Fay", "Gus", "Ivy", "Jo", "Kai",
+              "Lu", "Max", "Nia", "Omar", "Pia", "Quin", "Rex", "Sia", "Tam", "Uma"]
+let _LAST = ["Smith", "Foster", "Reyes", "Lin", "Patel", "Kane", "Ortiz", "Nash",
+             "Voss", "Diaz", "Cole", "Bell", "Ward", "Frost", "Hale", "Kerr"]
+let _WORDS = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+              "system", "builds", "data", "moves", "fast", "clean", "simple", "real"]
+let _DOMAINS = ["example.com", "mail.test", "demo.dev", "sample.org"]
+
+fn first_name() { return rng.choice(_FIRST) }
+fn last_name() { return rng.choice(_LAST) }
+fn name() { return first_name() + " " + last_name() }
+
+fn email() {
+  let f = first_name().lower()
+  let l = last_name().lower()
+  return f + "." + l + str(rng.randint(1, 99)) + "@" + rng.choice(_DOMAINS)
+}
+
+fn word() { return rng.choice(_WORDS) }
+
+fn sentence(word_count=8) {
+  let words = []
+  let i = 0
+  while i < word_count { words.push(word()); i = i + 1 }
+  let s = join(words, " ")
+  return s[0:1].upper() + s[1:] + "."
+}
+
+fn paragraph(sentence_count=4) {
+  let out = []
+  let i = 0
+  while i < sentence_count { out.push(sentence(rng.randint(5, 12))); i = i + 1 }
+  return join(out, " ")
+}
+
+fn number(lo, hi) { return rng.randint(lo, hi) }
+fn boolean() { return rng.randint(0, 1) == 1 }
+
+fn date(year_lo, year_hi) {
+  let y = rng.randint(year_lo, year_hi)
+  let m = rng.randint(1, 12)
+  let d = rng.randint(1, date_lib.days_in_month(y, m))
+  return _fmt_date(y, m, d)
+}
+fn _pad2(n) { return n < 10 ? "0" + str(n) : str(n) }
+fn _fmt_date(y, m, d) { return str(y) + "-" + _pad2(m) + "-" + _pad2(d) }

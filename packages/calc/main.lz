@@ -1,0 +1,122 @@
+# calc - a real tiny expression interpreter for arithmetic strings:
+# tokenizer -> recursive-descent parser -> evaluator, with correct
+# +-*/^ precedence and parentheses. No eval() shortcut - this is the
+# same shape as a real language front-end, just for one expression.
+#
+#   import "calc" as calc
+#   print(calc.evaluate("2 + 3 * 4"))         # 14
+#   print(calc.evaluate("(2 + 3) * 4"))       # 20
+#   print(calc.evaluate("2 ^ 3 ^ 2"))         # 512 (right-assoc)
+#   print(calc.explain("2 + 3 * 4"))
+
+fn _tokenize(expr) {
+  let tokens = []
+  let i = 0
+  let n = len(expr)
+  while i < n {
+    let c = expr[i:i+1]
+    if c == " " { i = i + 1; continue }
+    if "0123456789.".find(c) >= 0 {
+      let start = i
+      while i < n and "0123456789.".find(expr[i:i+1]) >= 0 { i = i + 1 }
+      tokens.push({"t": "num", "v": float(expr[start:i])})
+      continue
+    }
+    if "+-*/^()".find(c) >= 0 {
+      tokens.push({"t": "op", "v": c})
+      i = i + 1
+      continue
+    }
+    throw {"type": "LarzValueError", "message": "unexpected character '" + c + "' in expression"}
+  }
+  return tokens
+}
+
+fn _peek(st) { return st["i"] < len(st["toks"]) ? st["toks"][st["i"]] : nil }
+fn _advance(st) { let t = _peek(st); st["i"] = st["i"] + 1; return t }
+
+# expr := term (("+"|"-") term)*
+fn _parse_expr(st) {
+  let node = _parse_term(st)
+  while true {
+    let t = _peek(st)
+    if t == nil or t["t"] != "op" or (t["v"] != "+" and t["v"] != "-") { break }
+    _advance(st)
+    node = {"op": t["v"], "l": node, "r": _parse_term(st)}
+  }
+  return node
+}
+# term := power (("*"|"/") power)*
+fn _parse_term(st) {
+  let node = _parse_power(st)
+  while true {
+    let t = _peek(st)
+    if t == nil or t["t"] != "op" or (t["v"] != "*" and t["v"] != "/") { break }
+    _advance(st)
+    node = {"op": t["v"], "l": node, "r": _parse_power(st)}
+  }
+  return node
+}
+# power := unary ("^" power)?   -- right-associative
+fn _parse_power(st) {
+  let node = _parse_unary(st)
+  let t = _peek(st)
+  if t != nil and t["t"] == "op" and t["v"] == "^" {
+    _advance(st)
+    return {"op": "^", "l": node, "r": _parse_power(st)}
+  }
+  return node
+}
+fn _parse_unary(st) {
+  let t = _peek(st)
+  if t != nil and t["t"] == "op" and t["v"] == "-" {
+    _advance(st)
+    return {"op": "neg", "l": _parse_unary(st)}
+  }
+  return _parse_atom(st)
+}
+fn _parse_atom(st) {
+  let t = _advance(st)
+  if t == nil { throw {"type": "LarzValueError", "message": "unexpected end of expression"} }
+  if t["t"] == "num" { return {"num": t["v"]} }
+  if t["v"] == "(" {
+    let node = _parse_expr(st)
+    let close_ = _advance(st)
+    if close_ == nil or close_["v"] != ")" { throw {"type": "LarzValueError", "message": "missing closing parenthesis"} }
+    return node
+  }
+  throw {"type": "LarzValueError", "message": "unexpected token '" + str(t["v"]) + "'"}
+}
+
+fn _parse(expr) {
+  let st = {"toks": _tokenize(expr), "i": 0}
+  let node = _parse_expr(st)
+  if st["i"] != len(st["toks"]) { throw {"type": "LarzValueError", "message": "trailing input after expression"} }
+  return node
+}
+
+fn _eval_node(node) {
+  if node.has("num") { return node["num"] }
+  if node["op"] == "neg" { return -_eval_node(node["l"]) }
+  let l = _eval_node(node["l"])
+  let r = _eval_node(node["r"])
+  if node["op"] == "+" { return l + r }
+  if node["op"] == "-" { return l - r }
+  if node["op"] == "*" { return l * r }
+  if node["op"] == "/" { return l / r }
+  if node["op"] == "^" { return l ** r }
+  throw {"type": "LarzValueError", "message": "unknown operator '" + node["op"] + "'"}
+}
+
+fn evaluate(expr) { return _eval_node(_parse(expr)) }
+
+fn _describe(node) {
+  if node.has("num") { return str(node["num"]) }
+  if node["op"] == "neg" { return "-(" + _describe(node["l"]) + ")" }
+  return "(" + _describe(node["l"]) + " " + node["op"] + " " + _describe(node["r"]) + ")"
+}
+
+fn explain(expr) {
+  let tree = _parse(expr)
+  return _describe(tree) + " = " + str(_eval_node(tree))
+}

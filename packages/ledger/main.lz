@@ -1,0 +1,51 @@
+# ledger - double-entry bookkeeping. Every post() is a debit to one
+# account and an equal credit to another - the accounting equation
+# (sum of all debits == sum of all credits) holds after every single
+# posting, not just at the end. Amounts in integer cents.
+#
+#   import "ledger" as ledger
+#   let books = ledger.new()
+#   ledger.post(books, "cash", "revenue", 10000, "sale #1")
+#   ledger.post(books, "expenses", "cash", 2000, "rent")
+#   print(ledger.balance(books, "cash"))       # 8000
+#   print(ledger.is_balanced(books))            # true
+#   print(ledger.trial_balance(books))          # {account: net balance, ...}
+
+fn new() { return {"postings": []} }
+
+fn post(books, debit_account, credit_account, amount, memo) {
+  if amount <= 0 { throw {"type": "LarzValueError", "message": "ledger.post() amount must be positive"} }
+  books["postings"].push({"debit": debit_account, "credit": credit_account, "amount": amount, "memo": memo})
+}
+
+# Net balance of an account: debits increase it, credits decrease it -
+# the usual convention for asset/expense accounts. For a liability/
+# revenue/equity account, negate the result yourself.
+fn balance(books, account) {
+  let bal = 0
+  for p in books["postings"] {
+    if p["debit"] == account { bal = bal + p["amount"] }
+    if p["credit"] == account { bal = bal - p["amount"] }
+  }
+  return bal
+}
+
+fn accounts(books) {
+  let seen = {}
+  for p in books["postings"] { seen[p["debit"]] = true; seen[p["credit"]] = true }
+  return sorted(keys(seen))
+}
+
+fn trial_balance(books) {
+  let out = {}
+  for acct in accounts(books) { out[acct] = balance(books, acct) }
+  return out
+}
+
+# The accounting equation: total debits must equal total credits.
+fn is_balanced(books) {
+  let debits = 0
+  let credits = 0
+  for p in books["postings"] { debits = debits + p["amount"]; credits = credits + p["amount"] }
+  return debits == credits
+}

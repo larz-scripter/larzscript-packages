@@ -1,0 +1,47 @@
+# id - identities and verifiable credentials, sign & verify, tamper
+# detection. Larzscript has no arbitrary-precision integers (doubles
+# only give ~53 bits of exact integer range), so real public-key
+# cryptography (RSA/Ed25519) - and with it, TRUE self-certifying DIDs
+# verifiable by anyone without a shared secret - isn't honestly
+# buildable here. This package is the symmetric-key version instead: an
+# issuer signs a credential with a secret only they hold, and anyone
+# who ALSO holds that secret can verify it offline (no network call) and
+# detect any tampering (any change to the claims invalidates the
+# signature). That's a real, useful trust model (it's how most API
+# tokens and internal service credentials actually work) - just not a
+# decentralized one.
+#
+#   import "id" as id
+#   let identity = id.create("alice", "issuer-secret")
+#   let cred = id.issue(identity["id"], {"role": "admin"}, "issuer-secret")
+#   print(id.verify(cred, "issuer-secret"))     # true
+#   cred["claims"]["role"] = "superadmin"        # tampered
+#   print(id.verify(cred, "issuer-secret"))     # false
+
+import "crypto" as crypto
+import "json" as json
+
+# A deterministic, self-consistent id derived from name+secret - the
+# same (name, secret) pair always produces the same id, and a party
+# holding the secret can confirm an id was actually derived this way.
+fn create(name, secret) {
+  return {"id": "id:" + crypto.sha256(name + ":" + secret)[0:32], "name": name}
+}
+
+fn _canonical(subject_id, claims, issued_at) {
+  return subject_id + "|" + json.stringify(claims) + "|" + str(issued_at)
+}
+
+fn issue(subject_id, claims, issuer_secret) {
+  let issued_at = time()
+  let sig = crypto.hmac(issuer_secret, _canonical(subject_id, claims, issued_at))
+  return {"subject": subject_id, "claims": claims, "issued_at": issued_at, "sig": sig}
+}
+
+fn verify(cred, issuer_secret) {
+  let expected = crypto.hmac(issuer_secret, _canonical(cred["subject"], cred["claims"], cred["issued_at"]))
+  return expected == cred["sig"]
+}
+
+fn sign(message, secret) { return crypto.hmac(secret, message) }
+fn verify_signature(message, sig, secret) { return crypto.hmac(secret, message) == sig }

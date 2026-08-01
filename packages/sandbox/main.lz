@@ -1,0 +1,55 @@
+# sandbox - run untrusted Larzscript code and capture its output safely.
+# Larzscript has no in-process eval()/exec() for running a code string
+# inside the current interpreter, so real isolation here means real
+# process isolation: the submission is written to a temp file and run
+# as its own `larzscript` subprocess under the system `timeout` command
+# (a genuine wall-clock kill, not a cooperative one - an infinite loop
+# actually gets killed). "Restricted imports"/"restricted builtins" are
+# a static pre-scan of the submitted source for denied substrings before
+# it's ever executed, not a runtime sandbox inside the interpreter - a
+# submission that never imports/calls a denied name at the text level
+# passes the check honestly; this is not a security boundary against a
+# determined attacker, it's a grading safety net against accidental
+# misuse (an autograder's actual threat model).
+#
+#   import "sandbox" as sandbox
+#   let box = sandbox.new({"timeout": 3, "deny_imports": true})
+#   let result = sandbox.run(box, "print(1 + 2)")
+#   print(result["output"], result["ok"])
+#   print(sandbox.check_output(box, "print(2 + 2)", "4\n"))
+
+fn new(opts={}) {
+  return {
+    "timeout": opts.has("timeout") ? opts["timeout"] : 5,
+    "deny_imports": opts.has("deny_imports") ? opts["deny_imports"] : true,
+    "deny_builtins": opts.has("deny_builtins") ? opts["deny_builtins"] : ["run(", "capture(", "write_file(", "remove(", "rename(", "exit("],
+    "interpreter": opts.has("interpreter") ? opts["interpreter"] : "larzscript"
+  }
+}
+
+fn _static_violations(box, source) {
+  let violations = []
+  if box["deny_imports"] and source.find("import ") >= 0 { violations.push("imports are not allowed") }
+  for denied in box["deny_builtins"] {
+    if source.find(denied) >= 0 { violations.push("'" + denied + "' is not allowed") }
+  }
+  return violations
+}
+
+fn _q(s) { return "'" + s.replace("'", "'\\''") + "'" }
+
+fn run(box, source) {
+  let violations = _static_violations(box, source)
+  if len(violations) > 0 { return {"ok": false, "output": "", "violations": violations} }
+  let tmp = "/tmp/larz_sandbox_" + str(int(time() * 1000)) + ".lz"
+  write_file(tmp, source)
+  let cmd = "timeout " + str(box["timeout"]) + "s " + box["interpreter"] + " " + _q(tmp) + " 2>&1"
+  let output = capture(cmd)
+  remove(tmp)
+  return {"ok": true, "output": output, "violations": []}
+}
+
+fn check_output(box, source, expected) {
+  let result = run(box, source)
+  return result["ok"] and result["output"] == expected
+}
