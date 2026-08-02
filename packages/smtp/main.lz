@@ -1,0 +1,56 @@
+# smtp - sends a raw RFC822 message (exactly what `email.build()`
+# returns) over real SMTP, via curl (curl has real, mature SMTP/SMTPS
+# support - no separate mail transport agent needed, matching the
+# `http` package's "shells out to a real tool" pattern). Pairs directly
+# with `email`: build the message there, hand it to smtp.send() here -
+# or use smtp.transport(config) as `email`'s own injectable transport
+# so email.send(msg, config, smtp.transport(config)) just works.
+#
+#   import "smtp" as smtp
+#   import "email" as email
+#   let msg = email.build({"from": "a@example.com", "to": ["b@example.com"], "subject": "Hi", "text": "hello"})
+#   let ok = smtp.send(msg, {
+#     "host": "smtp.example.com", "port": 465, "tls": true,
+#     "user": "a@example.com", "password": "secret",
+#     "from": "a@example.com", "to": ["b@example.com"]
+#   })
+
+fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
+
+fn _default(config, key, fallback) { return config.has(key) ? config[key] : fallback }
+
+# Sends `message` (a raw RFC822 string) via SMTP. `config`: host, port,
+# from, to (a list), and optionally tls (default true -> smtps://),
+# user/password (omit both for an unauthenticated relay). Returns true
+# on success (curl's own exit code - a real network/auth failure comes
+# back as a real Larzscript `false`, not a swallowed exception).
+fn send(message, config) {
+  let tls = _default(config, "tls", true)
+  let scheme = tls ? "smtps" : "smtp"
+  let url = scheme + "://" + config["host"] + ":" + str(config["port"])
+  let tmp = "/tmp/larz_smtp_" + str(int(time() * 1000000)) + ".eml"
+  write_file(tmp, message)
+
+  let rcpt_flags = ""
+  for recipient in config["to"] { rcpt_flags = rcpt_flags + " --mail-rcpt " + _q(recipient) }
+
+  let auth_flags = ""
+  if config.has("user") and config.has("password") {
+    auth_flags = " --user " + _q(config["user"] + ":" + config["password"])
+  }
+
+  let cmd = "curl -fsS --url " + _q(url) +
+    " --mail-from " + _q(config["from"]) + rcpt_flags +
+    " --upload-file " + _q(tmp) + auth_flags
+
+  let ok = run(cmd + " >/dev/null 2>&1") == 0
+  remove(tmp)
+  return ok
+}
+
+# An `email.send(msg, cfg, transport)`-shaped function: returns a
+# one-argument closure over `config` so smtp becomes email's real
+# transport with no glue code at the call site.
+fn transport(config) {
+  return fn(message, cfg) { return send(message, config) }
+}

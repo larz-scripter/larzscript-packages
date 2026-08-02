@@ -1,0 +1,112 @@
+# statuscard - builds a clean, branded HTML status-alert email (a
+# color-coded status badge, a heading + intro, one <pre> log block per
+# section, and a CTA button) for background jobs and monitors to mail
+# themselves out. Modeled on a real production ops-alert template - but
+# de-branded: brand name, accent colors, footer text and the CTA are
+# all config, not hardcoded, so any app can drop its own identity in.
+# Hand the returned HTML string straight to smtp.send()/email.build(),
+# or your own mailer.
+#
+#   import "statuscard" as statuscard
+#   let brand = {"name": "Larz Ops", "accent": "#5b6cff", "accent2": "#9b5bff",
+#     "tag": "srv66 monitor", "cta_text": "Open health", "cta_href": "https://x/health",
+#     "footer": "Automated backend monitor. Reply to investigate."}
+#   let body = statuscard.build(brand, "Disk usage high", "root partition is over 90% full.",
+#     [{"title": "df -h (2)", "lines": ["/dev/sda1 92% /", "/dev/sdb1 40% /data"]}],
+#     "ALERT")
+
+import "html" as html
+
+fn _default(d, key, fallback) { return d.has(key) ? d[key] : fallback }
+
+# status -> (background, text) colors. Falls back to a neutral gray for
+# any status string outside the three built-ins, so custom statuses
+# ("WARN", "DOWN", ...) still render instead of erroring.
+fn _badge_colors(status) {
+  if status == "ALERT" { return ["#fde2e2", "#c0341d"] }
+  if status == "OK" { return ["#dcf5e3", "#1c7a40"] }
+  if status == "INFO" { return ["#e3e9ff", "#3a4bbf"] }
+  return ["#e9edf5", "#4a5161"]
+}
+
+fn _badge(status) {
+  let c = _badge_colors(status)
+  return "<span style=\"display:inline-block;padding:4px 13px;border-radius:999px;" +
+    "background:" + c[0] + ";color:" + c[1] + ";font-size:12px;font-weight:700;" +
+    "letter-spacing:.3px;\">" + html.escape(status) + "</span>"
+}
+
+fn _join_lines(lines) {
+  let out = ""
+  let i = 0
+  for line in lines {
+    out = out + (i > 0 ? "\n" : "") + str(line)
+    i = i + 1
+  }
+  return out
+}
+
+fn _section_html(sec) {
+  let title = sec["title"]
+  let lines = sec["lines"]
+  let hint = _default(sec, "hint", "")
+  let body = _join_lines(lines)
+  let body_html = html.escape(body == "" ? "(none)" : body)
+  let hint_html = hint == "" ? "" :
+    "<div style=\"font-size:12px;color:#7a8294;margin:2px 0 6px;\">" + html.escape(hint) + "</div>"
+  return "<tr><td style=\"padding:6px 26px;\">" +
+    "<div style=\"font-size:13px;font-weight:700;color:#1a1d24;margin:12px 0 4px;\">" + html.escape(title) + "</div>" +
+    hint_html +
+    "<pre style=\"margin:0;background:#0f1320;color:#d6e0f5;border-radius:9px;" +
+    "padding:13px 15px;font-size:12px;line-height:1.55;white-space:pre-wrap;" +
+    "word-break:break-word;font-family:SFMono-Regular,Consolas,monospace;\">" + body_html + "</pre>" +
+    "</td></tr>"
+}
+
+# Builds the full HTML email body. `brand`: name (required), and
+# optionally accent/accent2 (gradient header colors), tag (small header
+# label), cta_text/cta_href (button; omit either to drop the button),
+# footer (footer line). `sections`: a list of {"title", "lines",
+# "hint"?} dicts, rendered in order as <pre> log blocks. `status`: any
+# string - ALERT/OK/INFO get real color-coded badges, anything else
+# falls back to neutral gray so custom statuses still render.
+fn build(brand, heading, intro, sections, status="ALERT") {
+  let name = brand["name"]
+  let accent = _default(brand, "accent", "#5b6cff")
+  let accent2 = _default(brand, "accent2", "#9b5bff")
+  let tag = _default(brand, "tag", "")
+  let footer = _default(brand, "footer", "Automated notification.")
+  let cta_text = _default(brand, "cta_text", "")
+  let cta_href = _default(brand, "cta_href", "")
+
+  let secs = ""
+  for sec in sections { secs = secs + _section_html(sec) }
+
+  let tag_html = tag == "" ? "" :
+    "<span style=\"float:right;color:#e6e9ff;font-size:12px;padding-top:6px;\">" + html.escape(tag) + "</span>"
+
+  let cta_html = (cta_text == "" or cta_href == "") ? "" :
+    "<tr><td style=\"padding:20px 26px 8px;\">" +
+    "<a href=\"" + cta_href + "\" style=\"display:inline-block;background:" + accent + ";" +
+    "color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 20px;border-radius:9px;\">" +
+    html.escape(cta_text) + "</a></td></tr>"
+
+  return "<!doctype html><html><body style=\"margin:0;background:#eef0f4;" +
+    "font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;\">" +
+    "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#eef0f4;padding:26px 12px;\">" +
+    "<tr><td align=\"center\">" +
+    "<table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" " +
+    "style=\"max-width:600px;width:100%;background:#ffffff;border-radius:16px;overflow:hidden;" +
+    "border:1px solid #e3e7ef;box-shadow:0 6px 24px rgba(20,30,60,.06);\">" +
+    "<tr><td style=\"background:linear-gradient(135deg," + accent + "," + accent2 + ");padding:18px 26px;\">" +
+    "<span style=\"color:#fff;font-size:19px;font-weight:800;\">" + html.escape(name) + "</span>" +
+    tag_html +
+    "</td></tr>" +
+    "<tr><td style=\"padding:24px 26px 4px;\">" + _badge(status) +
+    "<h1 style=\"margin:14px 0 6px;font-size:21px;color:#15171d;font-weight:800;\">" + html.escape(heading) + "</h1>" +
+    "<p style=\"margin:0;font-size:14px;line-height:1.65;color:#525a68;\">" + html.escape(intro) + "</p>" +
+    "</td></tr>" + secs + cta_html +
+    "<tr><td style=\"background:#f7f8fb;border-top:1px solid #eef0f4;padding:16px 26px;font-size:12px;" +
+    "color:#8a93a3;line-height:1.6;\">" + html.escape(footer) + "</td></tr>" +
+    "</table></td></tr></table></body></html>"
+}

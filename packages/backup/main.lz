@@ -1,0 +1,120 @@
+# backup - manifest-based backup integrity + dated-snapshot retention,
+# extracted from a real production backup pipeline (a nightly
+# encrypted-tarball-to-cloud job). Scoped down to the portable part:
+# building/verifying a "sha256  size  path" MANIFEST.txt over a
+# directory tree, and pruning old dated snapshot directories. The
+# docker/postgres/rclone specifics of the real script are app-specific
+# and left to the caller - this covers the "did every file arrive
+# intact" and "don't let history pile up forever" pieces every backup
+# job needs regardless of what it's backing up.
+#
+# Hashing shells out to the real `sha256sum`/`du` tools rather than
+# `crypto.sha256` - crypto's SHA-256 is pure Larzscript and explicitly
+# documented as "fine for short inputs, not built for hashing
+# megabytes"; backup files are exactly the megabytes case.
+#
+#   import "backup" as backup
+#   let entries = backup.build_manifest("/path/to/staging")
+#   backup.write_manifest(entries, "/path/to/staging/MANIFEST.txt")
+#   ...later, after a copy/restore...
+#   let old = backup.read_manifest("/path/to/staging/MANIFEST.txt")
+#   let result = backup.verify(old, "/path/to/restored")
+#   print(result["ok"], "ok,", result["missing"], "missing,", result["mismatched"], "mismatched")
+#   backup.prune_history("/path/to/history", 14)   # keep only the last 14 days
+
+fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
+
+fn sha256_file(path) {
+  return capture("sha256sum " + _q(path)).split(" ")[0].strip()
+}
+
+# human-readable size (e.g. "4.0K", "12M") via `du -h`, matching the
+# real backup script's manifest format exactly.
+fn human_size(path) {
+  return capture("du -h " + _q(path)).split("\t")[0].strip()
+}
+
+# Every regular file under `dir`, recursively, as paths relative to
+# `dir` (sorted, for a deterministic manifest across runs).
+fn collect(dir) {
+  let out = capture("cd " + _q(dir) + " && find . -type f | cut -c3-")
+  let files = []
+  for line in out.split("\n") { if line.strip() != "" { files.push(line) } }
+  return sorted(files)
+}
+
+# Builds manifest entries ({"path","sha256","size"}) for every file
+# under `dir`. `files` defaults to backup.collect(dir).
+fn build_manifest(dir, files=nil) {
+  let list = files == nil ? collect(dir) : files
+  let entries = []
+  for rel in list {
+    let full = dir + "/" + rel
+    entries.push({"path": rel, "sha256": sha256_file(full), "size": human_size(full)})
+  }
+  return entries
+}
+
+fn manifest_text(entries, header="") {
+  let out = header == "" ? "" : (header + "\n")
+  out = out + "sha256  size  path\n"
+  for e in entries { out = out + e["sha256"] + "  " + e["size"] + "  " + e["path"] + "\n" }
+  return out
+}
+
+fn write_manifest(entries, path, header="") {
+  write_file(path, manifest_text(entries, header))
+  return true
+}
+
+# Parses a MANIFEST.txt back into entries, skipping the header line(s)
+# (anything that isn't "<64 lowercase-hex chars>  size  path" is
+# ignored, so a heading like "srv66 comprehensive backup - ..." or the
+# "sha256  size  path" column line pass through harmlessly).
+fn read_manifest(path) {
+  let lines = read_file(path).split("\n")
+  let entries = []
+  for line in lines {
+    if len(line) < 68 { continue }
+    let sha = line[0:64]
+    let is_hex = true
+    for c in sha { if "0123456789abcdef".find(c) == -1 { is_hex = false } }
+    if not is_hex { continue }
+    if line[64:66] != "  " { continue }
+    let rest = line[66:len(line)]
+    let idx = rest.find("  ")
+    if idx == -1 { continue }
+    let size = rest[0:idx]
+    let file_path = rest[idx + 2:len(rest)]
+    entries.push({"path": file_path, "sha256": sha, "size": size})
+  }
+  return entries
+}
+
+# Re-hashes every file `old` (a manifest, e.g. from read_manifest())
+# lists, under `dir`, and reports what's still intact. Returns
+# {"ok": [...paths], "missing": [...paths], "mismatched": [...paths]}.
+fn verify(old, dir) {
+  let ok = []
+  let missing = []
+  let mismatched = []
+  for e in old {
+    let full = dir + "/" + e["path"]
+    if not file_exists(full) { missing.push(e["path"]) }
+    else if sha256_file(full) != e["sha256"] { mismatched.push(e["path"]) }
+    else { ok.push(e["path"]) }
+  }
+  return {"ok": ok, "missing": missing, "mismatched": mismatched}
+}
+
+# Deletes dated snapshot directories under `history_dir` older than
+# `keep_days` (real mtime, not directory-name parsing - matches the
+# real script's `find ... -mtime +N -exec rm -rf {} \;`). Returns the
+# count removed.
+fn prune_history(history_dir, keep_days) {
+  let out = capture("find " + _q(history_dir) + " -maxdepth 1 -mindepth 1 -type d -mtime +" + str(keep_days))
+  let dirs = []
+  for line in out.split("\n") { if line.strip() != "" { dirs.push(line) } }
+  for d in dirs { run("rm -rf " + _q(d)) }
+  return len(dirs)
+}

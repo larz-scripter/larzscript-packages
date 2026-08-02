@@ -1,0 +1,81 @@
+# indexnow - submits URLs to the IndexNow protocol (api.indexnow.org),
+# which relays one submission to every participating search engine
+# (Bing, Yandex, Seznam, Naver) at once. Ported from a real production
+# submitter: single-URL-per-request streaming (one POST, a short pause,
+# next URL) rather than bulk/batch, per Microsoft's own guidance - bulk
+# submission trades a slightly smaller request count for a much larger
+# chance of a 429 and a stalled backlog. 429s get a real doubling
+# backoff (60s -> 120s -> 240s) instead of a single blind retry.
+#
+#   import "indexnow" as indexnow
+#   let accepted = indexnow.submit_urls(
+#     ["https://example.com/a", "https://example.com/b"],
+#     "example.com", "abc123yourindexnowkey"
+#   )
+#   print(accepted, "of 2 URLs accepted")
+#
+# `key` is the IndexNow key you generate once and publish at
+# https://<host>/<key>.txt (see indexnow.key_location) - the API checks
+# that file exists and matches before accepting submissions for `host`.
+
+let ENDPOINT = "https://api.indexnow.org/IndexNow"
+let SUBMIT_DELAY = 2       # seconds between individual URL submissions (be gentle)
+let RETRY_MAX = 3          # attempts on 429 rate limiting
+let RETRY_BACKOFF = 60     # base seconds, doubles each attempt: 60 -> 120 -> 240
+
+fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
+
+fn _pow2(n) {
+  let r = 1
+  let i = 0
+  while i < n { r = r * 2; i = i + 1 }
+  return r
+}
+
+# The IndexNow key-verification URL the API checks before it will accept
+# submissions for `host` - publish your key as a plain-text file there.
+fn key_location(host, key) { return "https://" + host + "/" + key + ".txt" }
+
+fn _post_status(url, body) {
+  let out = capture("curl -fsS -X POST -H " + _q("Content-Type: application/json; charset=utf-8") +
+    " --data " + _q(body) + " -o /dev/null -w '%{http_code}' " + _q(url) + " 2>/dev/null")
+  let n = out.strip()
+  return n == "" ? 0 : int(n)
+}
+
+# Submits a single URL. Returns true on HTTP 200/202, retrying on 429
+# with doubling backoff, giving up (false) on any other status or after
+# RETRY_MAX attempts.
+fn submit_one(url, host, key) {
+  let loc = key_location(host, key)
+  let body = "{\"host\":\"" + host + "\",\"key\":\"" + key + "\",\"keyLocation\":\"" +
+    loc + "\",\"urlList\":[\"" + url + "\"]}"
+
+  let attempt = 1
+  while attempt <= RETRY_MAX {
+    let code = _post_status(ENDPOINT, body)
+    if code == 200 or code == 202 { return true }
+    if code == 429 and attempt < RETRY_MAX {
+      sleep(RETRY_BACKOFF * _pow2(attempt - 1))
+      attempt = attempt + 1
+    } else {
+      return false
+    }
+  }
+  return false
+}
+
+# Submits each URL individually (streaming, with a SUBMIT_DELAY pause
+# between them) rather than as one bulk urlList. Returns the count of
+# URLs accepted (0..len(urls)).
+fn submit_urls(urls, host, key) {
+  let ok = 0
+  let n = len(urls)
+  let i = 0
+  for url in urls {
+    if submit_one(url, host, key) { ok = ok + 1 }
+    i = i + 1
+    if i < n { sleep(SUBMIT_DELAY) }
+  }
+  return ok
+}
