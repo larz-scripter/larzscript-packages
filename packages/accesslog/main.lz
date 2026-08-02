@@ -1,0 +1,82 @@
+# accesslog - parses the Apache/Nginx "combined" access log format:
+#   IP - - [timestamp] "METHOD PATH PROTOCOL" STATUS SIZE "REFERER" "USER_AGENT"
+# into structured records, plus external_referrers() - the actual point of
+# a real production backlink tracker: your access log already tells you
+# every external site embedding/linking to you, for free, in the Referer
+# header of every hit. Parses by splitting on the quoted segments (not
+# regex - the format is fixed and this reads more plainly), so an
+# embedded literal quote in a referer/UA is the one thing it can't
+# handle, same limitation the log format itself has.
+#
+#   import "accesslog" as accesslog
+#   let rec = accesslog.parse_line(line)
+#   # {"ip", "timestamp", "method", "path", "protocol", "status", "size", "referer", "user_agent"}
+#
+#   let records = accesslog.parse_lines(read_file("access.log"))
+#   let backlinks = accesslog.external_referrers(records, "yoursite.com")
+#   for b in backlinks { print(b["referer"], "->", b["hits"], "hits") }
+
+import "url" as url
+
+# Parses one combined-format log line. Returns nil if the line doesn't
+# have the expected 3 quoted segments (request/referer/user-agent).
+fn parse_line(line) {
+  let parts = line.split("\"")
+  if len(parts) < 6 { return nil }
+
+  let head = parts[0].strip()
+  let ip = head.split(" ")[0]
+  let ts_start = head.find("[")
+  let ts_end = head.find("]")
+  let timestamp = (ts_start != -1 and ts_end != -1) ? head[ts_start + 1:ts_end] : ""
+
+  let req = []
+  for tok in parts[1].strip().split(" ") { if tok != "" { req.push(tok) } }
+  let method = len(req) > 0 ? req[0] : ""
+  let path = len(req) > 1 ? req[1] : ""
+  let protocol = len(req) > 2 ? req[2] : ""
+
+  let mid = []
+  for tok in parts[2].strip().split(" ") { if tok != "" { mid.push(tok) } }
+  let status = (len(mid) > 0 and mid[0] != "-") ? int(mid[0]) : 0
+  let size = len(mid) > 1 ? mid[1] : "0"
+
+  return {"ip": ip, "timestamp": timestamp, "method": method, "path": path,
+          "protocol": protocol, "status": status, "size": size,
+          "referer": parts[3], "user_agent": len(parts) > 5 ? parts[5] : ""}
+}
+
+# Parses every line in `text`, skipping ones that don't match.
+fn parse_lines(text) {
+  let out = []
+  for line in text.split("\n") {
+    if line.strip() == "" { continue }
+    let rec = parse_line(line)
+    if rec != nil { out.push(rec) }
+  }
+  return out
+}
+
+fn _domain(u) {
+  let host = url.parse(u)["host"]
+  return host.find("www.") == 0 ? host[4:len(host)] : host
+}
+
+# Every distinct external referer (not `own_domain`, not "-"/empty),
+# aggregated with a hit count and the last path it referred to - the
+# actual backlink list: someone else's page is loading yours.
+fn external_referrers(records, own_domain) {
+  let seen = {}
+  for r in records {
+    let ref = r["referer"]
+    if ref == "" or ref == "-" { continue }
+    let dom = _domain(ref)
+    if dom == "" or dom.find(own_domain) != -1 { continue }
+    if not seen.has(ref) { seen[ref] = {"referer": ref, "domain": dom, "path": r["path"], "hits": 0} }
+    seen[ref]["hits"] = seen[ref]["hits"] + 1
+    seen[ref]["path"] = r["path"]
+  }
+  let out = []
+  for k in keys(seen) { out.push(seen[k]) }
+  return out
+}

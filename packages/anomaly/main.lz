@@ -1,0 +1,58 @@
+# anomaly - find cohorts whose event rate is implausible for their volume.
+# The same one computation runs both directions in real production: a bot
+# farm behind a clean UA is a cohort with high view volume and near-zero
+# CTR (find_low, catching fraud); an underperforming page with high
+# impressions and low CTR is the exact same shape (find_low again, this
+# time it's an SEO opportunity, not abuse). Ranking by volume, not rate
+# alone, matters - a 1-view/0-click cohort is noise, a 50,000-view/12-click
+# one is a real, actionable pattern. Only judges a cohort once it has had
+# a fair chance (min_volume) to clear the bar.
+#
+#   import "anomaly" as anomaly
+#   let cohorts = [
+#     {"key": "Mozilla/5.0 (bot farm UA)", "volume": 42000, "hits": 9},
+#     {"key": "Mozilla/5.0 (real users)",   "volume": 8000,  "hits": 340},
+#   ]
+#   let flagged = anomaly.find_low(cohorts, 2000, 0.001)   # >=2000 views, <0.1% rate
+#   for c in flagged { print(c["key"], c["volume"], "views,", c["rate"] * 100, "% rate") }
+#
+#   # the identical call, framed as an SEO opportunity instead of fraud:
+#   let opportunities = anomaly.find_low(pages, 150, 0.03)  # >=150 impressions, <3% CTR
+
+import "table" as table
+
+fn _score(cohorts, min_volume, keep) {
+  let out = []
+  for c in cohorts {
+    let volume = c["volume"]
+    if volume < min_volume { continue }
+    let rate = volume > 0 ? c["hits"] / volume : 0
+    if keep(rate) { out.push({"key": c["key"], "volume": volume, "hits": c["hits"], "rate": rate}) }
+  }
+  return table.sort(out, "volume", true)
+}
+
+# Cohorts with volume >= min_volume AND rate < max_rate, ranked by volume
+# descending - the shared shape behind both bot-cohort detection and
+# CTR-opportunity finding.
+fn find_low(cohorts, min_volume, max_rate) {
+  return _score(cohorts, min_volume, fn(r) { return r < max_rate })
+}
+
+# The opposite direction - cohorts with volume >= min_volume AND rate >
+# min_rate, ranked by volume descending (e.g. surfacing standout winners:
+# a promo code with real redemption volume AND an unusually high rate).
+fn find_high(cohorts, min_volume, min_rate) {
+  return _score(cohorts, min_volume, fn(r) { return r > min_rate })
+}
+
+# Writes `content` to `path` via a write-then-rename swap, so a reader
+# never sees a partially-written file - the same pattern the real fraud
+# scanner uses for its PHP blocklist, since a half-written file read by
+# a live request would be worse than a stale one.
+fn atomic_write(path, content) {
+  let tmp = path + ".tmp"
+  write_file(tmp, content)
+  rename(tmp, path)
+  return true
+}
