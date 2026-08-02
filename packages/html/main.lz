@@ -9,7 +9,7 @@
 #
 #   import "html" as html
 #   html.el("a", {"href": "/x"}, "A & B")                # escaped: A &amp; B
-#   html.el("input", {"disabled": true, "type": "text"})  # <input disabled type="text"/>
+#   html.void_el("input", {"disabled": true, "type": "text"})  # <input disabled type="text"/>
 #   html.void_el("br", {})                                 # <br/>
 #   html.page("Hi", html.tag("h1", "Hello <world>"))
 #   let trusted = html.markup(html.tag("b", "bold"))
