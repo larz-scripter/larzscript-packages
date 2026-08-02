@@ -1,14 +1,30 @@
-# crypto - real SHA-256 + HMAC-SHA256, in pure Larzscript (FIPS 180-4,
-# ported from the same implementation that backs `larzscript update`'s
-# release-integrity check). No bitwise operators exist in this language, so
-# AND/XOR are done bit-by-bit; rotation is done with pure arithmetic
-# (non-overlapping halves, so addition substitutes for OR - no bit-loop
-# needed there). Fine for short inputs (API keys, webhook payloads, tokens)
-# - not built for hashing megabytes.
+# crypto - real SHA-256 + HMAC-SHA256 + PBKDF2, in pure Larzscript
+# (FIPS 180-4, ported from the same implementation that backs
+# `larzscript update`'s release-integrity check), plus a real
+# encrypt-then-MAC AEAD built from those primitives (HMAC-SHA256-
+# counter-mode keystream, XOR, HMAC-SHA256 over ciphertext+AAD). No
+# bitwise operators exist in this language, so AND/XOR are done
+# bit-by-bit; rotation is done with pure arithmetic (non-overlapping
+# halves, so addition substitutes for OR - no bit-loop needed there).
+# Fine for short inputs (API keys, webhook payloads, tokens) - not
+# built for hashing megabytes.
+#
+# X25519/Ed25519 are NOT implemented and can't honestly be: both need
+# arbitrary-precision integer arithmetic (256-bit modular exponentiation
+# for the elliptic-curve math), and Larzscript's only numeric type is a
+# double - 53 bits of exact integer precision, nowhere near enough. A
+# real bignum library would be its own large undertaking, not something
+# to fake here. If you need real asymmetric crypto, this isn't the tool
+# - AEAD/HMAC/PBKDF2 below cover what's achievable with symmetric
+# primitives (see also `vault` for a password-based file-encryption
+# layer built on this same AEAD, and `id` for HMAC-based, not
+# public-key, "identity" credentials).
 #
 #   import "crypto" as crypto
 #   crypto.sha256("abc")            # "ba7816bf..."
 #   crypto.hmac("secret", "body")   # HMAC-SHA256 hex digest
+#   let enc = crypto.aead_encrypt("key", "secret data", "context-v1")
+#   crypto.aead_decrypt("key", enc["ciphertext"], enc["mac"], "context-v1")
 #
 # Runs its own self-test (the 2 standard NIST vectors) at import time and
 # throws if the hash routine is ever wrong - never trust a silently-broken
@@ -240,6 +256,87 @@ fn pbkdf2(password, salt, iterations) {
     k = k + 1
   }
   return _hex(result)
+}
+
+# ---- AEAD: HMAC-SHA256-counter-mode keystream, encrypt-then-MAC ----
+let _AEAD_HEXCH = "0123456789abcdef"
+fn _aead_to_hex(bytes_) {
+  let out = ""
+  for b in bytes_ { out = out + _AEAD_HEXCH[b // 16:b // 16 + 1] + _AEAD_HEXCH[b % 16:b % 16 + 1] }
+  return out
+}
+fn _aead_from_hex(hex_str) {
+  let out = []
+  let i = 0
+  while i < len(hex_str) {
+    out.push(_AEAD_HEXCH.find(hex_str[i:i+1]) * 16 + _AEAD_HEXCH.find(hex_str[i+1:i+2]))
+    i = i + 2
+  }
+  return out
+}
+fn _aead_xor(a, b) {
+  let out = []
+  let i = 0
+  while i < len(a) {
+    let x = a[i]
+    let y = b[i]
+    let r = 0
+    let place = 1
+    let k = 0
+    while k < 8 { if x % 2 != y % 2 { r = r + place } x = x // 2; y = y // 2; place = place * 2; k = k + 1 }
+    out.push(r)
+    i = i + 1
+  }
+  return out
+}
+fn _aead_keystream(key_hex, n) {
+  let out = []
+  let counter = 0
+  while len(out) < n {
+    for b in hmac_bytes(key_hex, str(counter)) { out.push(b) }
+    counter = counter + 1
+  }
+  return out[0:n]
+}
+fn _aead_secure_equal(a, b) {
+  let n = len(a) > len(b) ? len(a) : len(b)
+  let diff = len(a) != len(b) ? 1 : 0
+  let i = 0
+  while i < n {
+    let ca = i < len(a) ? a[i:i+1] : ""
+    let cb = i < len(b) ? b[i:i+1] : ""
+    if ca != cb { diff = 1 }
+    i = i + 1
+  }
+  return diff == 0
+}
+
+# Encrypt-then-MAC: returns {"ciphertext": hex, "mac": hex}. `aad`
+# (additional authenticated data) is bound into the MAC without being
+# encrypted, so ciphertext moved into a different context (different
+# aad) fails to authenticate - the downgrade-proofing property.
+fn aead_encrypt(key, plaintext, aad="") {
+  let key_enc = hmac(key, "enc")
+  let key_mac = hmac(key, "mac")
+  let plain_bytes = str_to_bytes(plaintext)
+  let ciphertext_bytes = _aead_xor(plain_bytes, _aead_keystream(key_enc, len(plain_bytes)))
+  let ciphertext_hex = _aead_to_hex(ciphertext_bytes)
+  let mac = hmac(key_mac, ciphertext_hex + "|" + aad)
+  return {"ciphertext": ciphertext_hex, "mac": mac}
+}
+
+fn aead_decrypt(key, ciphertext_hex, mac, aad="") {
+  let key_mac = hmac(key, "mac")
+  let expected_mac = hmac(key_mac, ciphertext_hex + "|" + aad)
+  if not _aead_secure_equal(expected_mac, mac) {
+    throw {"type": "LarzAeadAuthError", "message": "wrong key, tampered ciphertext, or aad mismatch"}
+  }
+  let key_enc = hmac(key, "enc")
+  let ciphertext_bytes = _aead_from_hex(ciphertext_hex)
+  let plain_bytes = _aead_xor(ciphertext_bytes, _aead_keystream(key_enc, len(ciphertext_bytes)))
+  let out = ""
+  for b in plain_bytes { out = out + chr(b) }
+  return out
 }
 
 fn _selftest() {

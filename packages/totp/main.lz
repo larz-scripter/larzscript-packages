@@ -1,13 +1,19 @@
-# totp - RFC 6238 time-based one-time codes, HMAC-SHA256 variant (many
-# authenticator apps support `algorithm=SHA256`, not just the original
-# SHA-1 default - this package only implements SHA-256, via `crypto`).
+# totp - RFC 6238 time-based (and RFC 4226 counter-based/HOTP) one-time
+# codes, HMAC-SHA256 variant (many authenticator apps support
+# `algorithm=SHA256`, not just the original SHA-1 default - this
+# package only implements SHA-256, via `crypto`). provisioning_uri()
+# builds the otpauth:// URI authenticator apps scan as a QR code.
 # Hosted-only (needs `crypto`, which the kernel's 8MB heap can't sustain).
 #
 #   import "totp" as totp
-#   let code = totp.generate(secret)      # 6-digit code for "now"
+#   let code = totp.generate(secret)      # 6-digit TOTP code for "now"
 #   totp.verify(secret, code)             # checks a +/-1 step drift window
+#   let hcode = totp.hotp_generate(secret, 42)     # HOTP for counter=42
+#   totp.hotp_verify(secret, 42, hcode)
+#   print(totp.provisioning_uri(secret, "ada@example.com", "MyApp"))
 
 import "crypto" as crypto
+import "url" as url
 
 # A raw 8-byte big-endian counter, as a byte LIST (not a string - a string
 # built via chr(0) concatenation silently truncates at the leading zero
@@ -47,4 +53,16 @@ fn verify(secret, code, step_seconds=30, digits=6, window=1) {
     w = w + 1
   }
   return false
+}
+
+fn hotp_generate(secret, counter, digits=6) { return _hotp(secret, counter, digits) }
+fn hotp_verify(secret, counter, code, digits=6) { return _hotp(secret, counter, digits) == code }
+
+# The otpauth:// URI an authenticator app scans (as a QR code) to add
+# this account - RFC's "Key Uri Format".
+fn provisioning_uri(secret, account_name, issuer="", digits=6, period=30) {
+  let label = issuer == "" ? url.encode(account_name) : url.encode(issuer) + ":" + url.encode(account_name)
+  let params = {"secret": secret, "algorithm": "SHA256", "digits": str(digits), "period": str(period)}
+  if issuer != "" { params["issuer"] = issuer }
+  return "otpauth://totp/" + label + "?" + url.build_query(params)
 }
