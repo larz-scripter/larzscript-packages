@@ -1,0 +1,114 @@
+# pathfind - A* search over a 2D grid: the real algorithm (an open set
+# ordered by f = g + h, a closed set, path reconstruction via a
+# came-from map), not a maze-solver toy. Built on this stack's own
+# `heap` for the open set's priority queue - real composability, not
+# a hand-rolled second heap. 4-directional by default (Manhattan
+# heuristic), or 8-directional with diagonals (Euclidean heuristic) -
+# pass your own heuristic function for anything else.
+#
+#   import "pathfind" as pf
+#   let g = pf.grid_new(5, 5)
+#   pf.grid_block(g, 1, 1); pf.grid_block(g, 2, 1); pf.grid_block(g, 3, 1)
+#   let path = pf.astar(g, {"x": 0, "y": 0}, {"x": 4, "y": 4})
+#   print(len(path))          # steps from start to goal, inclusive
+#   for p in path { print(p["x"], p["y"]) }
+
+import "heap" as heap
+
+fn grid_new(width, height) { return {"width": width, "height": height, "blocked": {}} }
+
+fn _cell_key(x, y) { return str(x) + "," + str(y) }
+
+fn grid_block(g, x, y) { g["blocked"][_cell_key(x, y)] = true }
+fn grid_is_blocked(g, x, y) { return g["blocked"].has(_cell_key(x, y)) }
+fn grid_in_bounds(g, x, y) { return x >= 0 and x < g["width"] and y >= 0 and y < g["height"] }
+
+fn manhattan(a, b) {
+  let dx = a["x"] - b["x"]
+  let dy = a["y"] - b["y"]
+  return (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy)
+}
+
+fn euclidean(a, b) {
+  let dx = a["x"] - b["x"]
+  let dy = a["y"] - b["y"]
+  return sqrt(dx * dx + dy * dy)
+}
+
+fn _neighbors(g, x, y, diagonal) {
+  let deltas = [[1, 0], [-1, 0], [0, 1], [0, -1]]
+  if diagonal { deltas = deltas + [[1, 1], [1, -1], [-1, 1], [-1, -1]] }
+  let out = []
+  for d in deltas {
+    let nx = x + d[0]
+    let ny = y + d[1]
+    if grid_in_bounds(g, nx, ny) and not grid_is_blocked(g, nx, ny) {
+      out.push({"x": nx, "y": ny, "cost": (d[0] != 0 and d[1] != 0) ? 1.4142135623730951 : 1.0})
+    }
+  }
+  return out
+}
+
+fn _reconstruct(came_from, goal_node, start_key) {
+  let path = [goal_node]
+  let cur = goal_node
+  while _cell_key(cur["x"], cur["y"]) != start_key {
+    cur = came_from[_cell_key(cur["x"], cur["y"])]
+    path = [cur] + path
+  }
+  return path
+}
+
+# Returns the shortest path from `start` to `goal` as a list of
+# {"x","y"} nodes INCLUDING both endpoints, or nil if no path exists.
+# opts: diagonal (default false), heuristic (default manhattan, or
+# euclidean if diagonal is true and you don't override it).
+fn astar(g, start, goal, opts={}) {
+  let diagonal = opts.has("diagonal") ? opts["diagonal"] : false
+  let heuristic_fn = opts.has("heuristic") ? opts["heuristic"] : (diagonal ? euclidean : manhattan)
+
+  let start_key = _cell_key(start["x"], start["y"])
+  let open = heap.new(fn(item) { return item["f"] })
+  let g_score = {}
+  g_score[start_key] = 0.0
+  heap.push(open, {"f": heuristic_fn(start, goal), "node": start})
+  let came_from = {}
+  let visited = {}
+
+  while not heap.is_empty(open) {
+    let cur = heap.pop(open)["node"]
+    let cur_key = _cell_key(cur["x"], cur["y"])
+    if visited.has(cur_key) { continue }
+    visited[cur_key] = true
+
+    if cur["x"] == goal["x"] and cur["y"] == goal["y"] {
+      return _reconstruct(came_from, cur, start_key)
+    }
+
+    for nb in _neighbors(g, cur["x"], cur["y"], diagonal) {
+      let nb_key = _cell_key(nb["x"], nb["y"])
+      if visited.has(nb_key) { continue }
+      let tentative_g = g_score[cur_key] + nb["cost"]
+      if not g_score.has(nb_key) or tentative_g < g_score[nb_key] {
+        g_score[nb_key] = tentative_g
+        came_from[nb_key] = cur
+        heap.push(open, {"f": tentative_g + heuristic_fn(nb, goal), "node": {"x": nb["x"], "y": nb["y"]}})
+      }
+    }
+  }
+  return nil
+}
+
+# Total path cost (sum of step costs, 1.0 orthogonal / sqrt(2) diagonal)
+# - not just len(path) - 1, which would undercount a diagonal-heavy path.
+fn path_cost(path, diagonal=false) {
+  let total = 0.0
+  let i = 1
+  while i < len(path) {
+    let dx = path[i]["x"] - path[i - 1]["x"]
+    let dy = path[i]["y"] - path[i - 1]["y"]
+    total = total + ((dx != 0 and dy != 0) ? 1.4142135623730951 : 1.0)
+    i = i + 1
+  }
+  return total
+}

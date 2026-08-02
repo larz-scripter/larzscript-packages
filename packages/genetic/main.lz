@@ -1,0 +1,121 @@
+# genetic - a real genetic algorithm: a population of gene-sequences
+# evolves toward whatever `fitness_fn` rewards, via tournament
+# selection (pick k at random, keep the fittest), single-point
+# crossover, per-gene mutation, and elitism (the current best always
+# survives unchanged). Genes are opaque to this package - characters,
+# numbers, anything `gene_fn()` can produce - so it optimizes over any
+# search space you can describe that way, not just the classic
+# string-matching demo.
+#
+#   import "genetic" as ga
+#   import "random" as rng
+#   rng.seed(1)
+#   let target = "LARZ"
+#   fn random_letter() { return chr(65 + rng.randint(0, 25)) }
+#   fn fitness(genes) {
+#     let score = 0
+#     let i = 0
+#     while i < len(genes) { if genes[i] == target[i:i+1] { score = score + 1 } i = i + 1 }
+#     return score
+#   }
+#   let pop = ga.population_random(150, len(target), random_letter)
+#   let final = ga.evolve(pop, fitness, random_letter, {"generations": 200})
+#   let best = ga.best_of(final)
+#   print(join(best["genes"], ""), best["fitness"])   # "LARZ" 4 - found the target
+
+import "random" as rng
+
+fn individual(genes, fitness=nil) { return {"genes": genes, "fitness": fitness} }
+
+fn population_random(size, gene_count, gene_fn) {
+  let pop = []
+  for _ in range(size) {
+    let genes = []
+    for _ in range(gene_count) { genes.push(gene_fn()) }
+    pop.push(individual(genes))
+  }
+  return pop
+}
+
+fn evaluate(pop, fitness_fn) {
+  for ind in pop { ind["fitness"] = fitness_fn(ind["genes"]) }
+}
+
+fn _tournament_select(pop, k) {
+  let best = nil
+  for _ in range(k) {
+    let candidate = pop[rng.randint(0, len(pop) - 1)]
+    if best == nil or candidate["fitness"] > best["fitness"] { best = candidate }
+  }
+  return best
+}
+
+# Single-point crossover: genes[0:point] from `a`, genes[point:] from `b`.
+fn crossover(a, b) {
+  let n = len(a["genes"])
+  let point = n <= 1 ? 1 : rng.randint(1, n - 1)
+  return individual(a["genes"][0:point] + b["genes"][point:])
+}
+
+# Each gene independently has probability `rate` of being replaced by a
+# fresh call to gene_fn() - the only source of genes not already in the
+# population, so this is what keeps a run from getting stuck.
+fn mutate(ind, rate, gene_fn) {
+  let genes = []
+  for g in ind["genes"] { genes.push(rng.random() < rate ? gene_fn() : g) }
+  return individual(genes)
+}
+
+fn best_of(pop) {
+  let best = pop[0]
+  for ind in pop { if ind["fitness"] > best["fitness"] { best = ind } }
+  return best
+}
+
+# Insertion sort by fitness, descending - no key-function sort builtin
+# in Larzscript, same pattern as `fuzzy.extract()`/`query.order_by()`.
+fn _sort_desc(pop) {
+  let out = []
+  for ind in pop { out.push(ind) }
+  let i = 1
+  while i < len(out) {
+    let cur = out[i]
+    let j = i - 1
+    while j >= 0 and out[j]["fitness"] < cur["fitness"] {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = cur
+    i = i + 1
+  }
+  return out
+}
+
+# opts: generations (default 100), tournament_k (default 3),
+# mutation_rate (default 0.02), elitism (default 1 - the current best
+# survives every generation unchanged).
+fn evolve(pop, fitness_fn, gene_fn, opts={}) {
+  let generations = opts.has("generations") ? opts["generations"] : 100
+  let k = opts.has("tournament_k") ? opts["tournament_k"] : 3
+  let mutation_rate = opts.has("mutation_rate") ? opts["mutation_rate"] : 0.02
+  let elitism = opts.has("elitism") ? opts["elitism"] : 1
+
+  evaluate(pop, fitness_fn)
+  let gen = 0
+  while gen < generations {
+    let ranked = _sort_desc(pop)
+    let next_gen = []
+    let e = 0
+    while e < elitism and e < len(ranked) { next_gen.push(ranked[e]); e = e + 1 }
+    while len(next_gen) < len(pop) {
+      let parent_a = _tournament_select(pop, k)
+      let parent_b = _tournament_select(pop, k)
+      let child = mutate(crossover(parent_a, parent_b), mutation_rate, gene_fn)
+      next_gen.push(child)
+    }
+    pop = next_gen
+    evaluate(pop, fitness_fn)
+    gen = gen + 1
+  }
+  return pop
+}

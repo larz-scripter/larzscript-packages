@@ -1,0 +1,191 @@
+# neural - a tiny autograd engine and neural network, in the spirit of
+# Karpathy's micrograd: every number is a `Value` node that remembers
+# how it was computed, forward and backward. Build any expression out
+# of add()/mul()/tanh()/relu(), call backward() on the result, and every
+# input Value's `.grad` field fills in with the real partial derivative -
+# reverse-mode automatic differentiation, the same algorithm every real
+# deep learning framework runs, shown at the scalar level where you can
+# actually watch it work.
+#
+#   import "neural" as nn
+#   let a = nn.value(-4.0)
+#   let b = nn.value(2.0)
+#   let c = nn.add(nn.mul(a, b), nn.tanh_(b))
+#   nn.backward(c)
+#   print(round(a["grad"], 4), round(b["grad"], 4))   # dc/da, dc/db
+#
+#   rng.seed(1)
+#   let m = nn.mlp(2, [4, 1])            # 2 inputs -> 4 hidden -> 1 output
+#   let out = nn.mlp_call(m, [nn.value(1.0), nn.value(-1.0)])
+
+import "random" as rng
+
+fn _exp(x) {
+  let whole = int(x)
+  if x < 0 and whole != x { whole = whole - 1 }
+  let frac = x - whole
+  let e_const = 2.718281828459045
+  let base = 1.0
+  let k = 0
+  while k < (whole < 0 ? -whole : whole) {
+    base = whole < 0 ? base / e_const : base * e_const
+    k = k + 1
+  }
+  let term = 1.0
+  let total = 1.0
+  let n = 1
+  while n < 25 { term = term * frac / n; total = total + term; n = n + 1 }
+  return base * total
+}
+
+let _next_id = 0
+
+# A scalar computation-graph node: {data, grad, prev (parent Values),
+# op (label), backward_fn (fills parents' .grad from this node's .grad)}.
+fn value(data, prev=[], op="") {
+  _next_id = _next_id + 1
+  return {"data": data, "grad": 0.0, "prev": prev, "op": op, "backward_fn": nil, "id": _next_id}
+}
+
+fn add(a, b) {
+  let out = value(a["data"] + b["data"], [a, b], "+")
+  out["backward_fn"] = fn() {
+    a["grad"] = a["grad"] + out["grad"]
+    b["grad"] = b["grad"] + out["grad"]
+  }
+  return out
+}
+
+fn mul(a, b) {
+  let out = value(a["data"] * b["data"], [a, b], "*")
+  out["backward_fn"] = fn() {
+    a["grad"] = a["grad"] + b["data"] * out["grad"]
+    b["grad"] = b["grad"] + a["data"] * out["grad"]
+  }
+  return out
+}
+
+fn pow_(a, n) {
+  let out = value(a["data"] ** n, [a], "**" + str(n))
+  out["backward_fn"] = fn() {
+    a["grad"] = a["grad"] + (n * (a["data"] ** (n - 1))) * out["grad"]
+  }
+  return out
+}
+
+fn neg(a) { return mul(a, value(-1.0)) }
+fn sub(a, b) { return add(a, neg(b)) }
+
+fn tanh_(a) {
+  let e2x = _exp(2.0 * a["data"])
+  let t = (e2x - 1.0) / (e2x + 1.0)
+  let out = value(t, [a], "tanh")
+  out["backward_fn"] = fn() {
+    a["grad"] = a["grad"] + (1.0 - t * t) * out["grad"]
+  }
+  return out
+}
+
+fn relu(a) {
+  let r = a["data"] > 0 ? a["data"] : 0.0
+  let out = value(r, [a], "relu")
+  out["backward_fn"] = fn() {
+    a["grad"] = a["grad"] + (a["data"] > 0 ? 1.0 : 0.0) * out["grad"]
+  }
+  return out
+}
+
+fn _build_topo(v, visited, topo) {
+  if not visited.has(str(v["id"])) {
+    visited[str(v["id"])] = true
+    for child in v["prev"] { _build_topo(child, visited, topo) }
+    topo.push(v)
+  }
+}
+
+# Reverse-mode autodiff: topologically sort the graph that produced `v`,
+# seed v.grad = 1, then walk backward calling each node's backward_fn -
+# by the time a node is visited, every node that consumes it has already
+# propagated its share of the gradient into it (that's what the
+# topological order guarantees).
+fn backward(v) {
+  let topo = []
+  let visited = {}
+  _build_topo(v, visited, topo)
+  v["grad"] = 1.0
+  let i = len(topo) - 1
+  while i >= 0 {
+    if topo[i]["backward_fn"] != nil { topo[i]["backward_fn"]() }
+    i = i - 1
+  }
+}
+
+fn zero_grad(params) {
+  for p in params { p["grad"] = 0.0 }
+}
+
+# ---- a tiny MLP, built entirely on the primitives above ----
+
+fn neuron(nin, nonlin=true) {
+  let w = []
+  for _ in range(nin) { w.push(value(rng.random() * 2.0 - 1.0)) }
+  return {"w": w, "b": value(0.0), "nonlin": nonlin}
+}
+
+fn neuron_call(n, x) {
+  let act = n["b"]
+  let i = 0
+  while i < len(n["w"]) {
+    act = add(act, mul(n["w"][i], x[i]))
+    i = i + 1
+  }
+  return n["nonlin"] ? tanh_(act) : act
+}
+
+fn layer(nin, nout, nonlin=true) {
+  let neurons = []
+  for _ in range(nout) { neurons.push(neuron(nin, nonlin)) }
+  return neurons
+}
+
+fn layer_call(l, x) {
+  let out = []
+  for n in l { out.push(neuron_call(n, x)) }
+  return out
+}
+
+# `nouts`: layer sizes after the input, e.g. mlp(2, [4, 4, 1]) is
+# 2 inputs -> 4 hidden -> 4 hidden -> 1 output. Every layer is tanh
+# except the last (linear output, the usual convention for regression).
+fn mlp(nin, nouts) {
+  let sizes = [nin] + nouts
+  let layers = []
+  let i = 0
+  while i < len(nouts) {
+    layers.push(layer(sizes[i], sizes[i + 1], i != len(nouts) - 1))
+    i = i + 1
+  }
+  return layers
+}
+
+fn mlp_call(m, x) {
+  let out = x
+  for l in m { out = layer_call(l, out) }
+  return out
+}
+
+fn parameters(m) {
+  let params = []
+  for l in m {
+    for n in l {
+      for w in n["w"] { params.push(w) }
+      params.push(n["b"])
+    }
+  }
+  return params
+}
+
+# Plain SGD: params[i].data -= lr * params[i].grad.
+fn step(params, lr) {
+  for p in params { p["data"] = p["data"] - lr * p["grad"] }
+}

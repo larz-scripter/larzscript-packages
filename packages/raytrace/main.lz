@@ -1,0 +1,161 @@
+# raytrace - a real ray tracer, in the spirit of "Ray Tracing in One
+# Weekend": ray-sphere intersection by the quadratic formula, real
+# lambertian (diffuse, random-hemisphere-scatter) and metal (reflective,
+# with fuzz) materials, recursive light bounces up to a depth limit,
+# antialiasing by averaging random samples per pixel, gamma-corrected
+# output, and a plain PPM (P3) image - a real, viewable render, not a
+# toy. No image library, no GPU - every pixel is a real recursive
+# `ray_color()` call.
+#
+#   import "raytrace" as rt
+#   import "random" as rng
+#   rng.seed(1)
+#   let ground = rt.sphere(rt.vec3(0, -100.5, -1), 100, rt.lambertian(rt.vec3(0.8, 0.8, 0.0)))
+#   let center = rt.sphere(rt.vec3(0, 0, -1), 0.5, rt.lambertian(rt.vec3(0.7, 0.3, 0.3)))
+#   let metal_ball = rt.sphere(rt.vec3(1, 0, -1), 0.5, rt.metal(rt.vec3(0.8, 0.6, 0.2), 0.3))
+#   let ppm = rt.render([ground, center, metal_ball], 100, 50, 20, 8)
+#   write_file("scene.ppm", ppm)
+
+import "random" as rng
+
+# ---- vec3 ----
+
+fn vec3(x, y, z) { return {"x": x, "y": y, "z": z} }
+fn vadd(a, b) { return vec3(a["x"] + b["x"], a["y"] + b["y"], a["z"] + b["z"]) }
+fn vsub(a, b) { return vec3(a["x"] - b["x"], a["y"] - b["y"], a["z"] - b["z"]) }
+fn vscale(a, t) { return vec3(a["x"] * t, a["y"] * t, a["z"] * t) }
+fn vmul(a, b) { return vec3(a["x"] * b["x"], a["y"] * b["y"], a["z"] * b["z"]) }
+fn vneg(a) { return vec3(-a["x"], -a["y"], -a["z"]) }
+fn vdot(a, b) { return a["x"] * b["x"] + a["y"] * b["y"] + a["z"] * b["z"] }
+fn vlen2(a) { return vdot(a, a) }
+fn vlen(a) { return sqrt(vlen2(a)) }
+fn vnorm(a) { let l = vlen(a); return vscale(a, 1.0 / l) }
+fn vreflect(v, n) { return vsub(v, vscale(n, 2.0 * vdot(v, n))) }
+
+fn ray(origin, dir) { return {"origin": origin, "dir": dir} }
+fn ray_at(r, t) { return vadd(r["origin"], vscale(r["dir"], t)) }
+
+fn sphere(center, radius, material) { return {"center": center, "radius": radius, "material": material} }
+
+fn lambertian(albedo) { return {"kind": "lambertian", "albedo": albedo} }
+fn metal(albedo, fuzz=0.0) { return {"kind": "metal", "albedo": albedo, "fuzz": fuzz} }
+
+fn _random_in_unit_sphere() {
+  while true {
+    let p = vec3(rng.random() * 2.0 - 1.0, rng.random() * 2.0 - 1.0, rng.random() * 2.0 - 1.0)
+    if vlen2(p) < 1.0 { return p }
+  }
+}
+
+# Ray-sphere intersection via the quadratic formula on |O + tD - C|^2 = r^2.
+# Picks the nearest root inside [t_min, t_max], or nil if neither is.
+fn hit_sphere(s, r, t_min, t_max) {
+  let oc = vsub(r["origin"], s["center"])
+  let a = vlen2(r["dir"])
+  let half_b = vdot(oc, r["dir"])
+  let c = vlen2(oc) - s["radius"] * s["radius"]
+  let disc = half_b * half_b - a * c
+  if disc < 0 { return nil }
+  let sqrtd = sqrt(disc)
+  let root = (-half_b - sqrtd) / a
+  if root < t_min or root > t_max {
+    root = (-half_b + sqrtd) / a
+    if root < t_min or root > t_max { return nil }
+  }
+  let p = ray_at(r, root)
+  let outward_normal = vscale(vsub(p, s["center"]), 1.0 / s["radius"])
+  let front_face = vdot(r["dir"], outward_normal) < 0
+  let normal = front_face ? outward_normal : vneg(outward_normal)
+  return {"t": root, "p": p, "normal": normal, "front_face": front_face, "material": s["material"]}
+}
+
+fn hit_world(spheres, r, t_min, t_max) {
+  let closest = t_max
+  let best = nil
+  for s in spheres {
+    let h = hit_sphere(s, r, t_min, closest)
+    if h != nil { closest = h["t"]; best = h }
+  }
+  return best
+}
+
+fn scatter(material, r_in, hit) {
+  if material["kind"] == "lambertian" {
+    let dir = vadd(hit["normal"], vnorm(_random_in_unit_sphere()))
+    if (dir["x"] < 0 ? -dir["x"] : dir["x"]) < 0.00000001 and (dir["y"] < 0 ? -dir["y"] : dir["y"]) < 0.00000001 and (dir["z"] < 0 ? -dir["z"] : dir["z"]) < 0.00000001 {
+      dir = hit["normal"]
+    }
+    return {"ok": true, "scattered": ray(hit["p"], dir), "attenuation": material["albedo"]}
+  }
+  let reflected = vreflect(vnorm(r_in["dir"]), hit["normal"])
+  let fuzzed = vadd(reflected, vscale(_random_in_unit_sphere(), material["fuzz"]))
+  return {"ok": vdot(fuzzed, hit["normal"]) > 0, "scattered": ray(hit["p"], fuzzed), "attenuation": material["albedo"]}
+}
+
+# Traces one ray: hits a sphere -> scatter and recurse (tinting by the
+# material's albedo along the way); misses everything -> a sky gradient
+# (white at the horizon, blue at the top). depth bounds recursion so a
+# ray bouncing between mirrors can't recurse forever.
+fn ray_color(r, world, depth) {
+  if depth <= 0 { return vec3(0.0, 0.0, 0.0) }
+  let hit = hit_world(world, r, 0.001, 1000000000.0)
+  if hit != nil {
+    let sc = scatter(hit["material"], r, hit)
+    if sc["ok"] { return vmul(sc["attenuation"], ray_color(sc["scattered"], world, depth - 1)) }
+    return vec3(0.0, 0.0, 0.0)
+  }
+  let unit_dir = vnorm(r["dir"])
+  let t = 0.5 * (unit_dir["y"] + 1.0)
+  return vadd(vscale(vec3(1.0, 1.0, 1.0), 1.0 - t), vscale(vec3(0.5, 0.7, 1.0), t))
+}
+
+fn camera(aspect_ratio) {
+  let viewport_h = 2.0
+  let viewport_w = aspect_ratio * viewport_h
+  let origin = vec3(0.0, 0.0, 0.0)
+  let horizontal = vec3(viewport_w, 0.0, 0.0)
+  let vertical = vec3(0.0, viewport_h, 0.0)
+  let lower_left = vsub(vsub(vsub(origin, vscale(horizontal, 0.5)), vscale(vertical, 0.5)), vec3(0.0, 0.0, 1.0))
+  return {"origin": origin, "horizontal": horizontal, "vertical": vertical, "lower_left": lower_left}
+}
+fn camera_ray(cam, u, v) {
+  let dir = vsub(vadd(vadd(cam["lower_left"], vscale(cam["horizontal"], u)), vscale(cam["vertical"], v)), cam["origin"])
+  return ray(cam["origin"], dir)
+}
+
+fn _clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x) }
+
+# Gamma-2 corrected (sqrt) 0-255 "r g b" text for one pixel, averaged
+# over `samples` antialiasing samples.
+fn write_color(pixel_sum, samples) {
+  let r = sqrt(pixel_sum["x"] / samples)
+  let g = sqrt(pixel_sum["y"] / samples)
+  let b = sqrt(pixel_sum["z"] / samples)
+  return str(int(256 * _clamp(r, 0.0, 0.999))) + " " + str(int(256 * _clamp(g, 0.0, 0.999))) + " " + str(int(256 * _clamp(b, 0.0, 0.999)))
+}
+
+# Renders `world` (a list of sphere()s) to a plain PPM (P3) string,
+# `width`x`height`, `samples` random rays per pixel for antialiasing,
+# `max_depth` light bounces.
+fn render(world, width, height, samples=10, max_depth=10) {
+  let cam = camera(width / height)
+  let lines = ["P3", str(width) + " " + str(height), "255"]
+  let j = height - 1
+  while j >= 0 {
+    let i = 0
+    while i < width {
+      let pixel = vec3(0.0, 0.0, 0.0)
+      let s = 0
+      while s < samples {
+        let u = (i + rng.random()) / (width - 1)
+        let v = (j + rng.random()) / (height - 1)
+        pixel = vadd(pixel, ray_color(camera_ray(cam, u, v), world, max_depth))
+        s = s + 1
+      }
+      lines.push(write_color(pixel, samples))
+      i = i + 1
+    }
+    j = j - 1
+  }
+  return join(lines, "\n") + "\n"
+}

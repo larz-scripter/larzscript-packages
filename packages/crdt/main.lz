@@ -1,0 +1,125 @@
+# crdt - conflict-free replicated data types: state that merges from
+# multiple diverged replicas back into one consistent value, with no
+# coordination and no "last write wins the whole object" data loss.
+# Every merge here is commutative, associative and idempotent - merge
+# A-then-B or B-then-A, merge twice, merge out of order across a flaky
+# network - the result is always the same. Directly relevant to a
+# money-native language: a counter that's safe to increment from two
+# offline wallets and reconcile later is exactly this shape.
+#
+#   import "crdt" as crdt
+#   let a = crdt.gcounter_new()
+#   let b = crdt.gcounter_new()
+#   crdt.gcounter_inc(a, "replica-a", 3)
+#   crdt.gcounter_inc(b, "replica-b", 5)
+#   let merged = crdt.gcounter_merge(a, b)
+#   print(crdt.gcounter_value(merged))    # 8 - both replicas' work survives
+
+# ---- G-Counter: grow-only counter. Each replica only ever increments
+# its OWN slot; merge takes the element-wise max of every replica's
+# slot (never double-counts, never loses an increment). ----
+
+fn gcounter_new() { return {} }
+
+fn gcounter_inc(c, replica_id, amount=1) {
+  c[replica_id] = (c.has(replica_id) ? c[replica_id] : 0) + amount
+}
+
+fn gcounter_value(c) {
+  let total = 0
+  for k in keys(c) { total = total + c[k] }
+  return total
+}
+
+fn gcounter_merge(a, b) {
+  let out = {}
+  for k in keys(a) { out[k] = a[k] }
+  for k in keys(b) {
+    let bv = b[k]
+    out[k] = out.has(k) and out[k] > bv ? out[k] : bv
+  }
+  return out
+}
+
+# ---- PN-Counter: increment AND decrement, as two G-Counters (P and N)
+# merged independently - value is P minus N, never negative-merges
+# wrong the way a single signed G-Counter would. ----
+
+fn pncounter_new() { return {"p": gcounter_new(), "n": gcounter_new()} }
+fn pncounter_inc(c, replica_id, amount=1) { gcounter_inc(c["p"], replica_id, amount) }
+fn pncounter_dec(c, replica_id, amount=1) { gcounter_inc(c["n"], replica_id, amount) }
+fn pncounter_value(c) { return gcounter_value(c["p"]) - gcounter_value(c["n"]) }
+fn pncounter_merge(a, b) { return {"p": gcounter_merge(a["p"], b["p"]), "n": gcounter_merge(a["n"], b["n"])} }
+
+# ---- LWW-Register: last-write-wins, by an explicit timestamp you
+# supply (a real clock, a Lamport clock, whatever your system already
+# has) - ties broken deterministically by replica id so every replica
+# resolves a genuine tie the same way, not "whichever happened to be
+# on the left of the merge call". ----
+
+fn lww_new(value, replica_id, timestamp) { return {"value": value, "replica_id": replica_id, "timestamp": timestamp} }
+
+fn lww_merge(a, b) {
+  if a["timestamp"] > b["timestamp"] { return a }
+  if b["timestamp"] > a["timestamp"] { return b }
+  return a["replica_id"] > b["replica_id"] ? a : b
+}
+
+# ---- OR-Set: observed-remove set. Every add is tagged with a unique
+# id (you supply it - e.g. `replica_id + ":" + str(counter)`, or the
+# `uuid` package); remove() tombstones every tag CURRENTLY visible for
+# that element, not the element itself - so an add concurrent with an
+# unrelated remove is never silently dropped ("add wins" on a genuine
+# concurrent add/remove of the SAME observed tag, the standard OR-Set
+# semantics). ----
+
+fn orset_new() { return {"added": {}, "removed": {}} }
+
+# A real copy, not a reference - use this before letting two replicas
+# of the same set diverge (dicts are reference types in Larzscript, so
+# `let b = a` would leave both names pointing at the same set).
+fn orset_clone(s) {
+  let added = {}
+  for k in keys(s["added"]) { added[k] = s["added"][k] }
+  let removed = {}
+  for k in keys(s["removed"]) { removed[k] = true }
+  return {"added": added, "removed": removed}
+}
+
+fn orset_add(s, element, tag) { s["added"][tag] = element }
+
+fn orset_remove(s, element) {
+  for tag in keys(s["added"]) {
+    if s["added"][tag] == element and not s["removed"].has(tag) { s["removed"][tag] = true }
+  }
+}
+
+fn orset_contains(s, element) {
+  for tag in keys(s["added"]) {
+    if s["added"][tag] == element and not s["removed"].has(tag) { return true }
+  }
+  return false
+}
+
+fn orset_values(s) {
+  let seen = {}
+  let out = []
+  for tag in keys(s["added"]) {
+    if not s["removed"].has(tag) {
+      let el = s["added"][tag]
+      let key = str(el)
+      if not seen.has(key) { seen[key] = true; out.push(el) }
+    }
+  }
+  return out
+}
+
+fn orset_merge(a, b) {
+  let added = {}
+  for k in keys(a["added"]) { added[k] = a["added"][k] }
+  for k in keys(b["added"]) { added[k] = b["added"][k] }
+  let removed = {}
+  for k in keys(a["removed"]) { removed[k] = true }
+  for k in keys(b["removed"]) { removed[k] = true }
+  return {"added": added, "removed": removed}
+}
