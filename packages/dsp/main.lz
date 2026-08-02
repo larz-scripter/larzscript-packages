@@ -253,3 +253,27 @@ fn noise() { return rng.random() * 2 - 1 }
 # Exponential decay envelope: 1.0 at t=0, decays toward 0 by `decay_rate`
 # (higher = faster). t in seconds.
 fn envelope_exp(t, decay_rate) { return _exp(-t * decay_rate) }
+
+# Linear-interpolation resampling - the honest way to actually change a
+# buffer's sample rate, not just relabel it in a WAV header (which
+# changes playback speed/pitch instead). Not sinc-quality, but real: each
+# output sample is a true interpolated value between its two nearest
+# input samples, not a nearest-neighbor guess.
+fn resample(samples, from_rate, to_rate) {
+  if from_rate == to_rate { return list(samples) }
+  let in_n = len(samples)
+  let out_n = int(in_n * to_rate / float(from_rate))
+  let ratio = from_rate / float(to_rate)
+  let out = []
+  let i = 0
+  while i < out_n {
+    let src_pos = i * ratio
+    let idx0 = int(src_pos)
+    let frac = src_pos - idx0
+    let s0 = idx0 < in_n ? samples[idx0] : 0.0
+    let s1 = (idx0 + 1) < in_n ? samples[idx0 + 1] : s0
+    out.push(s0 + (s1 - s0) * frac)
+    i = i + 1
+  }
+  return out
+}
