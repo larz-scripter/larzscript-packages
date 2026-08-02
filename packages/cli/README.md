@@ -1,6 +1,6 @@
 # lz-cli
 
-build CLI tools with subcommands and help. `larzscript larzpkg.lz install cli`.
+build CLI tools with subcommands and help. `larzscript pkg install cli`.
 
 ```
 import "cli" as cli

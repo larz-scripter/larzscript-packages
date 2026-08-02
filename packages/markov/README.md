@@ -1,7 +1,7 @@
 # lz-markov
 
 A small Markov-chain text generator, pure Larzscript - zero network, zero
-deps. `larzscript larzpkg.lz install markov`.
+deps. `larzscript pkg install markov`.
 
 ```
 import "markov" as markov

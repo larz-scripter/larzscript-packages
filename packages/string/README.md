@@ -1,6 +1,6 @@
 # lz-string
 
-string helpers (center, wrap, reverse, snake, ...). `larzscript larzpkg.lz install string`.
+string helpers (center, wrap, reverse, snake, ...). `larzscript pkg install string`.
 
 ```
 import "string" as s

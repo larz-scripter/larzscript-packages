@@ -3,7 +3,7 @@
 Input validation and hygiene checks - email/URL format, path traversal,
 SQLi/XSS pattern heuristics (defense-in-depth, not a guarantee - always
 use parameterized queries and proper output encoding).
-`larzscript larzpkg.lz install validate`.
+`larzscript pkg install validate`.
 
 ```
 import "validate" as validate

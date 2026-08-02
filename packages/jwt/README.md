@@ -1,7 +1,7 @@
 # lz-jwt
 
 Signed JSON tokens (header.payload.signature, base64url), via `crypto` +
-`json` + `base64`. Hosted-only. `larzscript larzpkg.lz install jwt`.
+`json` + `base64`. Hosted-only. `larzscript pkg install jwt`.
 
 ```
 import "jwt" as jwt

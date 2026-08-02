@@ -3,7 +3,7 @@
 Turn text into a clean URL slug. Install:
 
 ```
-larzscript larzpkg.lz install slugify
+larzscript pkg install slugify
 ```
 
 ```

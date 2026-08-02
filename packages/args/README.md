@@ -1,6 +1,6 @@
 # lz-args
 
-Simple CLI argument parsing for Larzscript. `larzscript larzpkg.lz install args`.
+Simple CLI argument parsing for Larzscript. `larzscript pkg install args`.
 
 ```
 import "args" as args

@@ -4,7 +4,7 @@ Parse compact duration strings ("1d2h3m4s", "90s") into seconds, and back -
 the reverse direction of `time`'s `humanize()`. Install:
 
 ```
-larzscript larzpkg.lz install duration
+larzscript pkg install duration
 ```
 
 ```

@@ -3,7 +3,7 @@
 A small Markdown-to-HTML converter, built on `regex` and `html`. Install:
 
 ```
-larzscript larzpkg.lz install markdown
+larzscript pkg install markdown
 ```
 
 ```

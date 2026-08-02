@@ -4,7 +4,7 @@ Look up a MIME type from a filename/extension. A curated common subset
 (~40 types), not the full IANA registry. Install:
 
 ```
-larzscript larzpkg.lz install mime
+larzscript pkg install mime
 ```
 
 ```

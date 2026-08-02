@@ -1,7 +1,7 @@
 # lz-apikey
 
 Generate and verify opaque API keys - store the hash, never the raw key.
-`larzscript larzpkg.lz install apikey`.
+`larzscript pkg install apikey`.
 
 ```
 import "apikey" as apikey

@@ -1,7 +1,7 @@
 # lz-budget
 
 Category-based budget tracking on the Money type.
-`larzscript larzpkg.lz install budget`.
+`larzscript pkg install budget`.
 
 ```
 import "budget" as budget

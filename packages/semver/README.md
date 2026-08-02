@@ -4,7 +4,7 @@ Semantic version (major.minor.patch) parse and compare. No pre-release/
 build-metadata suffixes - a deliberately small subset. Install:
 
 ```
-larzscript larzpkg.lz install semver
+larzscript pkg install semver
 ```
 
 ```

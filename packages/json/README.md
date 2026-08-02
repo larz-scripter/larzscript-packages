@@ -1,6 +1,6 @@
 # lz-json
 
-JSON parse and stringify, in pure Larzscript. Install: `larzscript larzpkg.lz install json`.
+JSON parse and stringify, in pure Larzscript. Install: `larzscript pkg install json`.
 
 ```
 import "json" as json

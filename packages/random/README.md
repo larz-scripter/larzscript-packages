@@ -1,6 +1,6 @@
 # lz-random
 
-a small seeded PRNG (deterministic, non-crypto). `larzscript larzpkg.lz install random`.
+a small seeded PRNG (deterministic, non-crypto). `larzscript pkg install random`.
 
 ```
 import "random" as r

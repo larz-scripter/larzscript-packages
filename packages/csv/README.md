@@ -1,6 +1,6 @@
 # lz-csv
 
-Parse and write CSV in pure Larzscript (handles quoted fields). `larzscript larzpkg.lz install csv`.
+Parse and write CSV in pure Larzscript (handles quoted fields). `larzscript pkg install csv`.
 
 ```
 import "csv" as csv

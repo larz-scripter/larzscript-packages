@@ -1,7 +1,7 @@
 # lz-invoice
 
 Build and format invoices from Money line items.
-`larzscript larzpkg.lz install invoice`.
+`larzscript pkg install invoice`.
 
 ```
 import "invoice" as invoice

@@ -5,7 +5,7 @@ against the standard NIST vectors at import time. Also has `pbkdf2` (a
 password KDF - note each iteration is ~0.5s on this interpreter, so real
 production iteration counts aren't practical here) and `hmac_bytes`/
 `hmac_raw`/`str_to_bytes` for callers that need raw bytes (used by `totp`/
-`jwt`). `larzscript larzpkg.lz install crypto`.
+`jwt`). `larzscript pkg install crypto`.
 
 ```
 import "crypto" as crypto

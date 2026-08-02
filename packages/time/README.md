@@ -1,6 +1,6 @@
 # lz-time
 
-time and duration helpers. `larzscript larzpkg.lz install time`.
+time and duration helpers. `larzscript pkg install time`.
 
 ```
 import "time" as t

@@ -3,7 +3,7 @@
 A LIFO stack. Install:
 
 ```
-larzscript larzpkg.lz install stack
+larzscript pkg install stack
 ```
 
 ```

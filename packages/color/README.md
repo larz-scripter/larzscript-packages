@@ -1,6 +1,6 @@
 # lz-color
 
-ANSI terminal colors for Larzscript. `larzscript larzpkg.lz install color`.
+ANSI terminal colors for Larzscript. `larzscript pkg install color`.
 
 ```
 import "color" as c

@@ -1,7 +1,7 @@
 # lz-ratelimit
 
 Token-bucket rate limiting in ~20 lines - caller owns the state.
-`larzscript larzpkg.lz install ratelimit`.
+`larzscript pkg install ratelimit`.
 
 ```
 import "ratelimit" as ratelimit

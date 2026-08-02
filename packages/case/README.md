@@ -4,7 +4,7 @@ Naming-convention converters (camelCase, PascalCase, kebab-case) - pairs
 with `string`'s `snake()`. Install:
 
 ```
-larzscript larzpkg.lz install case
+larzscript pkg install case
 ```
 
 ```

@@ -1,7 +1,7 @@
 # lz-totp
 
 RFC 6238 time-based one-time codes (HMAC-SHA256 variant), via `crypto`.
-Hosted-only. `larzscript larzpkg.lz install totp`.
+Hosted-only. `larzscript pkg install totp`.
 
 ```
 import "totp" as totp

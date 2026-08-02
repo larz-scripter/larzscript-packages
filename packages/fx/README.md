@@ -1,7 +1,7 @@
 # lz-fx
 
 Currency conversion with a settable rate table, fully offline.
-`larzscript larzpkg.lz install fx`.
+`larzscript pkg install fx`.
 
 ```
 import "fx" as fx

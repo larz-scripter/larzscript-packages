@@ -1,7 +1,7 @@
 # lz-loan
 
 Interest and amortization calculations, Money-aware.
-`larzscript larzpkg.lz install loan`.
+`larzscript pkg install loan`.
 
 ```
 import "loan" as loan

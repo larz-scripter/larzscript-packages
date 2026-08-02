@@ -4,7 +4,7 @@ Basic descriptive statistics on a list of numbers. Complements `mathx`
 (number theory) rather than overlapping it. Install:
 
 ```
-larzscript larzpkg.lz install stats
+larzscript pkg install stats
 ```
 
 ```

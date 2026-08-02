@@ -3,7 +3,7 @@
 Simple `{{var}}` string templating (Mustache-lite). Install:
 
 ```
-larzscript larzpkg.lz install template
+larzscript pkg install template
 ```
 
 ```

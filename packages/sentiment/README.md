@@ -1,7 +1,7 @@
 # lz-sentiment
 
 Lexicon-based sentiment scoring + bag-of-words similarity, pure Larzscript.
-`larzscript larzpkg.lz install sentiment`.
+`larzscript pkg install sentiment`.
 
 ```
 import "sentiment" as sentiment

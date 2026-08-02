@@ -1,7 +1,7 @@
 # lz-acl
 
 Simple IP allow/deny access control lists, built on `ip.in_cidr`.
-`larzscript larzpkg.lz install acl`.
+`larzscript pkg install acl`.
 
 ```
 import "acl" as acl

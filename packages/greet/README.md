@@ -1,6 +1,6 @@
 # lz-greet
 
-A tiny Larzscript package. `larzscript larzpkg.lz install greet`, then:
+A tiny Larzscript package. `larzscript pkg install greet`, then:
 
 ```
 import "greet" as g

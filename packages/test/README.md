@@ -1,6 +1,6 @@
 # lz-test
 
-A tiny test framework for Larzscript. `larzscript larzpkg.lz install test`.
+A tiny test framework for Larzscript. `larzscript pkg install test`.
 
 ```
 import "test" as t

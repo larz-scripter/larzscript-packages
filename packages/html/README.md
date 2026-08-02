@@ -1,6 +1,6 @@
 # lz-html
 
-build HTML safely with automatic escaping. `larzscript larzpkg.lz install html`.
+build HTML safely with automatic escaping. `larzscript pkg install html`.
 
 ```
 import "html" as h

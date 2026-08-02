@@ -1,7 +1,7 @@
 # lz-uuid
 
 RFC 4122 version 4 UUID generation, built on `random`.
-`larzscript larzpkg.lz install uuid`.
+`larzscript pkg install uuid`.
 
 ```
 import "uuid" as uuid

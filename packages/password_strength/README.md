@@ -1,7 +1,7 @@
 # lz-password_strength
 
 Password strength scoring: length, character-class diversity, a common-
-password blocklist. `larzscript larzpkg.lz install password_strength`.
+password blocklist. `larzscript pkg install password_strength`.
 
 ```
 import "password_strength" as pwstrength

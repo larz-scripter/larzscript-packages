@@ -1,7 +1,7 @@
 # lz-webhook
 
 Sign and verify webhook payloads with HMAC-SHA256 (via `crypto`).
-`larzscript larzpkg.lz install webhook`.
+`larzscript pkg install webhook`.
 
 ```
 import "webhook" as webhook

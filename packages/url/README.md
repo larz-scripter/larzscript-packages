@@ -4,7 +4,7 @@ URL parsing/building and query-string encode/decode. Pure Larzscript, no
 `http`/curl dependency - safe anywhere, including the kernel. Install:
 
 ```
-larzscript larzpkg.lz install url
+larzscript pkg install url
 ```
 
 ```

@@ -3,7 +3,7 @@
 A FIFO queue. Install:
 
 ```
-larzscript larzpkg.lz install queue
+larzscript pkg install queue
 ```
 
 ```

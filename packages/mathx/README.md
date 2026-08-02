@@ -3,7 +3,7 @@
 Small pure-Larzscript math helpers. Install with the Larzscript package manager:
 
 ```
-larzscript larzpkg.lz install mathx
+larzscript pkg install mathx
 ```
 
 Then in your program:

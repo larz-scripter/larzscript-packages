@@ -5,7 +5,7 @@ generates a valid check digit. Checks the number is **well-formed**, not
 that a card is real/active/authorized. Install:
 
 ```
-larzscript larzpkg.lz install luhn
+larzscript pkg install luhn
 ```
 
 ```

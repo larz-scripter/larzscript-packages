@@ -1,7 +1,7 @@
 # lz-ip
 
 IPv4 address parsing, validation, and CIDR matching, pure Larzscript.
-`larzscript larzpkg.lz install ip`.
+`larzscript pkg install ip`.
 
 ```
 import "ip" as ip

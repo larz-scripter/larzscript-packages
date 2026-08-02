@@ -1,6 +1,6 @@
 # lz-log
 
-simple leveled logging with timestamps. `larzscript larzpkg.lz install log`.
+simple leveled logging with timestamps. `larzscript pkg install log`.
 
 ```
 import "log" as log

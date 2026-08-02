@@ -3,7 +3,7 @@
 A real set type, built on a dict-as-membership-map. Install:
 
 ```
-larzscript larzpkg.lz install set
+larzscript pkg install set
 ```
 
 ```

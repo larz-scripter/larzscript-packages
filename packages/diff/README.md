@@ -1,7 +1,7 @@
 # lz-diff
 
 Line-based diff between two strings (LCS-based), pure Larzscript.
-`larzscript larzpkg.lz install diff`.
+`larzscript pkg install diff`.
 
 ```
 import "diff" as diff

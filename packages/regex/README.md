@@ -5,7 +5,7 @@ Pattern matching for Larzscript, built on the interpreter's native
 with the Larzscript package manager:
 
 ```
-larzscript larzpkg.lz install regex
+larzscript pkg install regex
 ```
 
 Then in your program:

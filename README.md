@@ -5,7 +5,7 @@ package. Install any of them with the package manager built into
 [larzscript](https://github.com/larz-scripter/larzscript):
 
 ```
-larzscript larzpkg.lz install mathx
+larzscript pkg install mathx
 ```
 
 ## Packages

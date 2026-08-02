@@ -1,7 +1,7 @@
 # lz-tax
 
 Flat-rate and progressive-bracket tax calculators, Money-aware.
-`larzscript larzpkg.lz install tax`.
+`larzscript pkg install tax`.
 
 ```
 import "tax" as tax
