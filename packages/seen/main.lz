@@ -1,0 +1,74 @@
+# seen - a persisted "have I already processed this id" set, for a
+# poller that should only act on genuinely NEW items each run (a new
+# order, a new inbox message, a new row in a query). This exact small
+# thing gets hand-rolled - open a state file, split it into a set,
+# diff, re-save - independently across a dozen real production
+# scripts (payment-hold alerts, HARO digest scanning, indexing
+# submission, puzzle generation, inbox scanning); this is that pattern,
+# done once.
+#
+#   import "seen" as seen
+#   let ids = ["order_101", "order_102", "order_103"]
+#   let fresh = seen.filter_new("/var/lib/app/.orders_seen", ids)
+#   for id in fresh { alert_owner(id) }   # only the ones never seen before
+#
+#   seen.mark("/var/lib/app/.orders_seen", "order_104")   # record one directly
+#   seen.has("/var/lib/app/.orders_seen", "order_104")     # true
+#   seen.forget("/var/lib/app/.orders_seen", "order_104")  # e.g. to re-alert later
+#   seen.reset("/var/lib/app/.orders_seen")                 # clear everything
+
+fn _load(state_path) {
+  if not file_exists(state_path) { return {} }
+  let m = {}
+  for line in read_file(state_path).split("\n") {
+    let t = line.strip()
+    if t != "" { m[t] = true }
+  }
+  return m
+}
+
+fn _save(state_path, m) {
+  let ids = sorted(keys(m))
+  write_file(state_path, len(ids) > 0 ? (join(ids, "\n") + "\n") : "")
+}
+
+# True if `id` has already been marked seen.
+fn has(state_path, id) { return _load(state_path).has(str(id)) }
+
+# Records `id` as seen (idempotent - marking an already-seen id is a no-op).
+fn mark(state_path, id) {
+  let m = _load(state_path)
+  m[str(id)] = true
+  _save(state_path, m)
+  return true
+}
+
+# Un-marks `id`, so it will be treated as new again (e.g. to re-alert
+# after a false positive, or once whatever it flagged is resolved).
+fn forget(state_path, id) {
+  let m = _load(state_path)
+  let k = str(id)
+  if m.has(k) { m.remove(k); _save(state_path, m) }
+  return true
+}
+
+# Clears every id - the next filter_new()/has() sees a fresh set.
+fn reset(state_path) { write_file(state_path, ""); return true }
+
+# Every id currently marked seen, sorted.
+fn all(state_path) { return sorted(keys(_load(state_path))) }
+
+# The subset of `ids` NOT already marked seen, in their original order
+# - and records all of them (the whole batch, old and new) as seen in
+# one single save, matching the real watchers this is ported from:
+# check the whole batch, alert on what's new, persist once.
+fn filter_new(state_path, ids) {
+  let m = _load(state_path)
+  let fresh = []
+  for id in ids {
+    let k = str(id)
+    if not m.has(k) { fresh.push(id); m[k] = true }
+  }
+  if len(fresh) > 0 { _save(state_path, m) }
+  return fresh
+}
