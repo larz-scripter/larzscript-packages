@@ -1,0 +1,63 @@
+# dispatch - a multi-tenant outbound webhook registry: register N
+# destinations (each its own URL + secret), then send() looks one up
+# by key, signs the payload, POSTs it, and reports whether it actually
+# landed. Ported from a real production multi-app payment router that
+# credits several different merchant apps from one shared payment
+# backend - each app has its own webhook URL and its own signing
+# secret, and the backend doesn't know or care which app it's talking
+# to beyond the registry lookup. Composes with the rest of the stack
+# rather than reimplementing it: json for the body, webhook for the
+# HMAC signature, curl for the POST.
+#
+#   import "dispatch" as dispatch
+#   let hub = dispatch.hub()
+#   dispatch.register(hub, "cryptolarz", "https://cryptolarz.com/api/webhook", "secret-a")
+#   dispatch.register(hub, "drlarz", "https://gateway.example.com/webhook", "secret-b")
+#
+#   let ok = dispatch.send(hub, "cryptolarz", {"user": "a@example.com", "amount_usd": 5})
+#   # signs the JSON body with HMAC-SHA256, POSTs with an X-Signature header,
+#   # returns true only on a real HTTP 200 - never a swallowed exception
+
+import "json" as json
+import "webhook" as webhook
+
+fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
+
+# A fresh, empty registry.
+fn hub() { return {} }
+
+# Adds (or overwrites) a destination. Returns the hub, so calls chain.
+fn register(h, app, url, secret) {
+  h[app] = {"url": url, "secret": secret}
+  return h
+}
+
+fn unregister(h, app) {
+  if h.has(app) { h.remove(app) }
+  return h
+}
+
+# The {"url","secret"} for `app`, or nil if it isn't registered.
+fn destination(h, app) { return h.has(app) ? h[app] : nil }
+
+fn _post_status(url, body, headers) {
+  let hflags = ""
+  for k in keys(headers) { hflags = hflags + " -H " + _q(k + ": " + headers[k]) }
+  let out = capture("curl -fsS -X POST" + hflags + " --data " + _q(body) +
+    " -o /dev/null -w '%{http_code}' " + _q(url) + " 2>/dev/null")
+  let n = out.strip()
+  return n == "" ? 0 : int(n)
+}
+
+# Signs `payload` (a dict, JSON-encoded) with the registered secret for
+# `app`, POSTs it with an X-Signature header, and returns true only on
+# a real HTTP 200 - false if `app` isn't registered, the destination
+# is unreachable, or it responds with anything other than 200.
+fn send(h, app, payload) {
+  let dest = destination(h, app)
+  if dest == nil { return false }
+  let body = json.stringify(payload)
+  let sig = webhook.sign(body, dest["secret"])
+  let code = _post_status(dest["url"], body, {"Content-Type": "application/json", "X-Signature": sig})
+  return code == 200
+}
