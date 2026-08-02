@@ -8,6 +8,12 @@ package. Install any of them with the package manager built into
 larzscript pkg install mathx
 ```
 
+**Browse all 160+ packages** (a real tested example on every page, always
+current) at **[larzos.com/stack/](https://larzos.com/stack/)**, or see 8 of
+them chained together to solve real problems in the
+**[cookbook](https://larzos.com/stack/cookbook/)**. The table below is a
+quick offline reference and may lag slightly behind new additions.
+
 ## Packages
 
 | name | description |
@@ -159,6 +165,28 @@ Larzscript, one per Larz Stack library slot (`larzcart` -> `cart`, etc.):
 | [watch](packages/watch) | poll a directory for created/modified/deleted files matching a glob pattern |
 | [ws](packages/ws) | RFC 6455 WebSocket frame encoding/decoding |
 | [xml](packages/xml) | a small, safe XML |
+| [money](packages/money) | exact money, never a float |
+| [logic](packages/logic) | boolean logic you can see |
+| [units](packages/units) | unit conversion + dimensional checks |
+| [netbridge](packages/netbridge) | reverse SSH tunnels through a relay, no inbound port needed |
+| [neural](packages/neural) | reverse-mode autodiff + a tiny trainable neural net, from scratch |
+| [raytrace](packages/raytrace) | a real ray tracer, rendered to a real PPM image |
+| [crdt](packages/crdt) | conflict-free replicated data types (G-Counter, OR-Set, ...) |
+| [genetic](packages/genetic) | a real genetic algorithm (selection, crossover, mutation, elitism) |
+| [pathfind](packages/pathfind) | real A* search over a grid |
+| [indexnow](packages/indexnow) | single-URL streaming submission to the IndexNow search-engine API |
+| [smtp](packages/smtp) | real SMTP/SMTPS sending via curl |
+| [statuscard](packages/statuscard) | a branded, de-templated HTML status-alert email builder |
+| [backup](packages/backup) | sha256+size+path manifest integrity + real mtime-based retention |
+| [quota](packages/quota) | a shared, flock-atomic sliding-window quota multiple processes draw from |
+| [monitor](packages/monitor) | debounced ok/fail alerting - first failure, every Nth repeat, one recovery |
+| [imap](packages/imap) | search/fetch email over real IMAP via curl - the read side of smtp |
+| [logtail](packages/logtail) | incremental byte-offset log tailing, no re-scanning old lines |
+| [sitemap](packages/sitemap) | diff-and-append sitemap.xml builder |
+| [seen](packages/seen) | a persisted "have I already processed this id" dedup set |
+| [anomaly](packages/anomaly) | find cohorts whose event rate is implausible for their volume |
+| [accesslog](packages/accesslog) | parse Apache/Nginx combined access logs, find your backlinks for free |
+| [dispatch](packages/dispatch) | a multi-tenant outbound webhook registry, N destinations, one backend |
 
 ## Adding a package
 
