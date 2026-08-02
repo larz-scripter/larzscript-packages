@@ -1,0 +1,145 @@
+# units - unit conversion with dimensional checking: convert between
+# units and refuse nonsense (metres to feet is fine, metres to kilograms
+# throws). Handles the affine temperature scales (C/F/K) correctly, not
+# forced into the same linear-factor table as everything else. A
+# Quantity (a value carrying its own unit) adds/converts safely -
+# dimension-mismatched arithmetic throws instead of silently producing
+# a meaningless number.
+#
+#   import "units" as units
+#   print(units.convert(5, "km", "mi"))
+#   print(units.convert(100, "C", "F"))
+#   let a = units.qty(5, "m")
+#   let b = units.qty(30, "cm")
+#   print(units.qty_str(units.qty_add(a, b)))         # "5.3 m"
+#   print(units.compatible("mi", "kg"))                # false
+
+# name -> {"dim", "factor" (to base unit), "is_temp"}
+let UNITS = {
+  # length (base metre)
+  "m": {"dim": "length", "factor": 1.0, "is_temp": false},
+  "km": {"dim": "length", "factor": 1000.0, "is_temp": false},
+  "cm": {"dim": "length", "factor": 0.01, "is_temp": false},
+  "mm": {"dim": "length", "factor": 0.001, "is_temp": false},
+  "um": {"dim": "length", "factor": 0.000001, "is_temp": false},
+  "nm": {"dim": "length", "factor": 0.000000001, "is_temp": false},
+  "mi": {"dim": "length", "factor": 1609.344, "is_temp": false},
+  "yd": {"dim": "length", "factor": 0.9144, "is_temp": false},
+  "ft": {"dim": "length", "factor": 0.3048, "is_temp": false},
+  "in": {"dim": "length", "factor": 0.0254, "is_temp": false},
+  "nmi": {"dim": "length", "factor": 1852.0, "is_temp": false},
+  # mass (base kilogram)
+  "kg": {"dim": "mass", "factor": 1.0, "is_temp": false},
+  "g": {"dim": "mass", "factor": 0.001, "is_temp": false},
+  "mg": {"dim": "mass", "factor": 0.000001, "is_temp": false},
+  "t": {"dim": "mass", "factor": 1000.0, "is_temp": false},
+  "lb": {"dim": "mass", "factor": 0.45359237, "is_temp": false},
+  "oz": {"dim": "mass", "factor": 0.028349523125, "is_temp": false},
+  "st": {"dim": "mass", "factor": 6.35029318, "is_temp": false},
+  # time (base second)
+  "s": {"dim": "time", "factor": 1.0, "is_temp": false},
+  "ms": {"dim": "time", "factor": 0.001, "is_temp": false},
+  "min": {"dim": "time", "factor": 60.0, "is_temp": false},
+  "h": {"dim": "time", "factor": 3600.0, "is_temp": false},
+  "day": {"dim": "time", "factor": 86400.0, "is_temp": false},
+  "week": {"dim": "time", "factor": 604800.0, "is_temp": false},
+  # temperature (affine - factor unused, converted via kelvin below)
+  "K": {"dim": "temperature", "factor": 1.0, "is_temp": true},
+  "C": {"dim": "temperature", "factor": 1.0, "is_temp": true},
+  "F": {"dim": "temperature", "factor": 1.0, "is_temp": true},
+  # data (base byte, decimal + binary)
+  "bit": {"dim": "data", "factor": 0.125, "is_temp": false},
+  "byte": {"dim": "data", "factor": 1.0, "is_temp": false},
+  "kb": {"dim": "data", "factor": 1000.0, "is_temp": false},
+  "mb": {"dim": "data", "factor": 1000000.0, "is_temp": false},
+  "gb": {"dim": "data", "factor": 1000000000.0, "is_temp": false},
+  "tb": {"dim": "data", "factor": 1000000000000.0, "is_temp": false},
+  "KiB": {"dim": "data", "factor": 1024.0, "is_temp": false},
+  "MiB": {"dim": "data", "factor": 1048576.0, "is_temp": false},
+  "GiB": {"dim": "data", "factor": 1073741824.0, "is_temp": false},
+  "TiB": {"dim": "data", "factor": 1099511627776.0, "is_temp": false},
+  # volume (base litre)
+  "l": {"dim": "volume", "factor": 1.0, "is_temp": false},
+  "ml": {"dim": "volume", "factor": 0.001, "is_temp": false},
+  "cl": {"dim": "volume", "factor": 0.01, "is_temp": false},
+  "gal": {"dim": "volume", "factor": 3.785411784, "is_temp": false},
+  "pt": {"dim": "volume", "factor": 0.473176473, "is_temp": false},
+  "cup": {"dim": "volume", "factor": 0.2365882365, "is_temp": false}
+}
+
+fn _lookup(name) {
+  if not UNITS.has(name) { throw {"type": "LarzUnknownUnitError", "message": "unknown unit: '" + name + "'"} }
+  return UNITS[name]
+}
+
+fn _to_kelvin(v, unit) {
+  if unit == "K" { return v }
+  if unit == "C" { return v + 273.15 }
+  if unit == "F" { return (v - 32.0) * 5.0 / 9.0 + 273.15 }
+  throw {"type": "LarzUnitError", "message": "'" + unit + "' is not a temperature unit"}
+}
+fn _from_kelvin(k, unit) {
+  if unit == "K" { return k }
+  if unit == "C" { return k - 273.15 }
+  if unit == "F" { return (k - 273.15) * 9.0 / 5.0 + 32.0 }
+  throw {"type": "LarzUnitError", "message": "'" + unit + "' is not a temperature unit"}
+}
+
+# Convert `value` from one unit to another (same dimension only).
+fn convert(value, from_unit, to_unit) {
+  let uf = _lookup(from_unit)
+  let ut = _lookup(to_unit)
+  if uf["dim"] != ut["dim"] {
+    throw {"type": "LarzIncompatibleUnitsError", "message": "cannot convert " + from_unit + " to " + to_unit + " (different dimensions)"}
+  }
+  if uf["is_temp"] { return _from_kelvin(_to_kelvin(value, from_unit), to_unit) }
+  return value * uf["factor"] / ut["factor"]
+}
+
+# Whether two units measure the same dimension.
+fn compatible(a, b) { return _lookup(a)["dim"] == _lookup(b)["dim"] }
+
+# The dimension name of a unit (e.g. "length").
+fn dimension(unit) { return _lookup(unit)["dim"] }
+
+# ---- Quantity: a value with a unit; arithmetic is dimensionally checked ----
+
+fn qty(value, unit) { _lookup(unit); return {"value": value, "unit": unit} }
+
+fn qty_to(q, unit) { return qty(convert(q["value"], q["unit"], unit), unit) }
+
+fn qty_add(a, b) { return qty(a["value"] + qty_to(b, a["unit"])["value"], a["unit"]) }
+fn qty_sub(a, b) { return qty(a["value"] - qty_to(b, a["unit"])["value"], a["unit"]) }
+fn qty_mul(q, scalar) { return qty(q["value"] * scalar, q["unit"]) }
+
+# Dividing by a compatible Quantity gives a dimensionless ratio (a plain
+# number); dividing by a scalar gives a Quantity in the same unit.
+fn qty_div(q, divisor) {
+  if type(divisor) == "dict" and divisor.has("unit") {
+    if not compatible(q["unit"], divisor["unit"]) { throw {"type": "LarzIncompatibleUnitsError", "message": "cannot divide those units"} }
+    return q["value"] / qty_to(divisor, q["unit"])["value"]
+  }
+  return qty(q["value"] / divisor, q["unit"])
+}
+
+fn _qty_base(q) {
+  let u = _lookup(q["unit"])
+  return u["is_temp"] ? _to_kelvin(q["value"], q["unit"]) : q["value"] * u["factor"]
+}
+
+fn qty_eq(a, b) {
+  if not compatible(a["unit"], b["unit"]) { return false }
+  let diff = _qty_base(a) - _qty_base(b)
+  return (diff < 0 ? -diff : diff) < 0.000000001
+}
+
+fn qty_lt(a, b) {
+  if not compatible(a["unit"], b["unit"]) { throw {"type": "LarzIncompatibleUnitsError", "message": "cannot compare different dimensions"} }
+  return _qty_base(a) < _qty_base(b)
+}
+
+fn qty_str(q) {
+  let v = q["value"]
+  let shown = v == int(v) ? str(int(v)) : str(v)
+  return shown + " " + q["unit"]
+}

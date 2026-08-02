@@ -1,0 +1,170 @@
+# logic - boolean logic you can see: evaluate expressions written in
+# plain words ("A and (B or not C)") and generate the full truth table,
+# so you can see exactly when an expression is true. Pairs with `bits`.
+# A hand-written recursive-descent parser (no eval), precedence low to
+# high: or < xor < and < not.
+#
+#   import "logic" as logic
+#   print(logic.evaluate("A and (B or not C)", {"A": true, "B": false, "C": false}))
+#   print(logic.variables("A and (B or not C)"))
+#   print(logic.truth_table_str("A and B"))
+
+fn _is_alpha(c) { return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_" }
+fn _is_alnum(c) { return _is_alpha(c) or (c >= "0" and c <= "9") }
+
+fn _tokenize(s) {
+  let toks = []
+  let i = 0
+  let n = len(s)
+  while i < n {
+    let c = s[i:i+1]
+    if c == " " or c == "\t" or c == "\n" { i = i + 1 }
+    else if c == "(" or c == ")" { toks.push(c); i = i + 1 }
+    else if _is_alpha(c) {
+      let j = i
+      while j < n and _is_alnum(s[j:j+1]) { j = j + 1 }
+      toks.push(s[i:j])
+      i = j
+    } else {
+      throw {"type": "LarzLogicError", "message": "unexpected character '" + c + "'"}
+    }
+  }
+  return toks
+}
+
+fn _peek(st) { return st["i"] < len(st["t"]) ? st["t"][st["i"]] : nil }
+fn _advance(st) { let tok = _peek(st); st["i"] = st["i"] + 1; return tok }
+fn _kw(st) { let p = _peek(st); return p == nil ? nil : p.lower() }
+
+# precedence (low to high): or < xor < and < not
+fn _parse_or(st) {
+  let node = _parse_xor(st)
+  while _kw(st) == "or" { _advance(st); node = {"kind": "or", "l": node, "r": _parse_xor(st)} }
+  return node
+}
+fn _parse_xor(st) {
+  let node = _parse_and(st)
+  while _kw(st) == "xor" { _advance(st); node = {"kind": "xor", "l": node, "r": _parse_and(st)} }
+  return node
+}
+fn _parse_and(st) {
+  let node = _parse_not(st)
+  while _kw(st) == "and" { _advance(st); node = {"kind": "and", "l": node, "r": _parse_not(st)} }
+  return node
+}
+fn _parse_not(st) {
+  if _kw(st) == "not" { _advance(st); return {"kind": "not", "l": _parse_not(st)} }
+  return _parse_atom(st)
+}
+fn _parse_atom(st) {
+  let tok = _advance(st)
+  if tok == nil { throw {"type": "LarzLogicError", "message": "unexpected end of expression"} }
+  if tok == "(" {
+    let node = _parse_or(st)
+    if _advance(st) != ")" { throw {"type": "LarzLogicError", "message": "missing closing parenthesis"} }
+    return node
+  }
+  let low = tok.lower()
+  if low == "true" or low == "false" { return {"kind": "const", "value": low == "true"} }
+  if low == "and" or low == "or" or low == "not" or low == "xor" {
+    throw {"type": "LarzLogicError", "message": "unexpected operator '" + tok + "'"}
+  }
+  return {"kind": "var", "name": tok}
+}
+
+fn _parse(expr) {
+  let st = {"t": _tokenize(expr), "i": 0}
+  let node = _parse_or(st)
+  if _peek(st) != nil { throw {"type": "LarzLogicError", "message": "unexpected token '" + _peek(st) + "'"} }
+  return node
+}
+
+fn _eval(node, values) {
+  let kind = node["kind"]
+  if kind == "var" {
+    if not values.has(node["name"]) { throw {"type": "LarzLogicError", "message": "no value given for variable '" + node["name"] + "'"} }
+    return values[node["name"]] ? true : false
+  }
+  if kind == "const" { return node["value"] }
+  if kind == "not" { return not _eval(node["l"], values) }
+  let left = _eval(node["l"], values)
+  if kind == "and" { return left and _eval(node["r"], values) }
+  if kind == "or" { return left or _eval(node["r"], values) }
+  if kind == "xor" { return left != _eval(node["r"], values) }
+  throw {"type": "LarzLogicError", "message": "unknown node kind '" + kind + "'"}
+}
+
+# Evaluate a boolean expression given a dict of variable -> true/false.
+fn evaluate(expr, values) { return _eval(_parse(expr), values) }
+
+fn _walk_vars(node, found) {
+  let kind = node["kind"]
+  if kind == "var" { if not (node["name"] in found) { found.push(node["name"]) } }
+  else if kind == "and" or kind == "or" or kind == "xor" { _walk_vars(node["l"], found); _walk_vars(node["r"], found) }
+  else if kind == "not" { _walk_vars(node["l"], found) }
+}
+
+# The sorted list of variable names used in `expr`.
+fn variables(expr) {
+  let found = []
+  _walk_vars(_parse(expr), found)
+  return sorted(found)
+}
+
+# {"names": [...], "rows": [{"assign": {...}, "result": bool}, ...]}
+# covering every combination of the variables.
+fn truth_table(expr) {
+  let node = _parse(expr)
+  let names = variables(expr)
+  let n = len(names)
+  let rows = []
+  let total = 2 ** n
+  let bits = 0
+  while bits < total {
+    let assign = {}
+    let idx = 0
+    while idx < n {
+      let shift = n - 1 - idx
+      let bitval = (bits // (2 ** shift)) % 2
+      assign[names[idx]] = bitval == 1
+      idx = idx + 1
+    }
+    rows.push({"assign": assign, "result": _eval(node, assign)})
+    bits = bits + 1
+  }
+  return {"names": names, "rows": rows}
+}
+
+fn _center(s, width) {
+  let total_pad = width - len(s)
+  if total_pad <= 0 { return s }
+  let left = total_pad // 2
+  let right = total_pad - left
+  return (" " * left) + s + (" " * right)
+}
+
+# A printable truth table for `expr` (T/F columns per variable + result).
+fn truth_table_str(expr) {
+  let tt = truth_table(expr)
+  let names = tt["names"]
+  let header = names + [expr]
+  let widths = []
+  for h in header { widths.push(len(h) > 1 ? len(h) : 1) }
+  fn fmt(cells) {
+    let parts = []
+    let i = 0
+    while i < len(cells) { parts.push(_center(cells[i], widths[i])); i = i + 1 }
+    return join(parts, " | ")
+  }
+  let out = [fmt(header)]
+  let sep_parts = []
+  for w in widths { sep_parts.push("-" * w) }
+  out.push(join(sep_parts, "-+-"))
+  for row in tt["rows"] {
+    let cells = []
+    for nm in names { cells.push(row["assign"][nm] ? "T" : "F") }
+    cells.push(row["result"] ? "T" : "F")
+    out.push(fmt(cells))
+  }
+  return join(out, "\n")
+}

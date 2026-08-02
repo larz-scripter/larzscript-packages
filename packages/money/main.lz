@@ -1,0 +1,323 @@
+# money - exact, multi-currency money: an integer count of minor units
+# (cents) plus a currency, never a value that silently drifted through
+# float arithmetic. Seven rounding modes (HALF_UP/HALF_EVEN/HALF_DOWN/
+# UP/DOWN/CEILING/FLOOR), split()/allocate() that always reconcile to
+# the exact original (no cent created or lost), a curated ISO-4217
+# registry plus register() for custom currencies (crypto, points
+# systems, testnets), and an exchange-rate table for conversion at an
+# explicit rate you supply (this package never fetches rates itself).
+#
+# Honest limitation: Larzscript's only numeric type is a double (no
+# arbitrary-precision decimal the way Python's `decimal` module gives
+# the original larzmoney), so amounts here are float-precision, same as
+# every other money-shaped package in this stack (`cart`, `tax`,
+# `ledger`). Fine for real-world amounts; not a bignum ledger.
+#
+#   import "money" as money
+#   let m = money.of("10.99", "USD")
+#   print(money.format(m))                          # "$10.99"
+#   print(money.format(money.percent(money.of("10.00", "USD"), "8.25")))  # sales tax
+#   print(money.split(money.of("100.00", "USD"), 3))  # no cent is lost
+#   let fx = money.exchange_new("USD")
+#   money.exchange_add(fx, "EUR", "0.92")
+#   print(money.format(money.exchange_convert(fx, money.of("100", "USD"), "EUR")))
+
+# ---- currency registry ----
+
+let _TABLE = {
+  "USD": {"exp": 2, "sym": "$", "name": "US Dollar"},
+  "EUR": {"exp": 2, "sym": "€", "name": "Euro"},
+  "GBP": {"exp": 2, "sym": "£", "name": "Pound Sterling"},
+  "JPY": {"exp": 0, "sym": "¥", "name": "Yen"},
+  "CNY": {"exp": 2, "sym": "¥", "name": "Yuan Renminbi"},
+  "CHF": {"exp": 2, "sym": "CHF", "name": "Swiss Franc"},
+  "CAD": {"exp": 2, "sym": "$", "name": "Canadian Dollar"},
+  "AUD": {"exp": 2, "sym": "$", "name": "Australian Dollar"},
+  "NZD": {"exp": 2, "sym": "$", "name": "New Zealand Dollar"},
+  "HKD": {"exp": 2, "sym": "$", "name": "Hong Kong Dollar"},
+  "SGD": {"exp": 2, "sym": "$", "name": "Singapore Dollar"},
+  "INR": {"exp": 2, "sym": "₹", "name": "Indian Rupee"},
+  "NGN": {"exp": 2, "sym": "₦", "name": "Naira"},
+  "ZAR": {"exp": 2, "sym": "R", "name": "Rand"},
+  "GHS": {"exp": 2, "sym": "₵", "name": "Ghana Cedi"},
+  "KES": {"exp": 2, "sym": "KSh", "name": "Kenyan Shilling"},
+  "EGP": {"exp": 2, "sym": "£", "name": "Egyptian Pound"},
+  "BRL": {"exp": 2, "sym": "R$", "name": "Brazilian Real"},
+  "MXN": {"exp": 2, "sym": "$", "name": "Mexican Peso"},
+  "ARS": {"exp": 2, "sym": "$", "name": "Argentine Peso"},
+  "CLP": {"exp": 0, "sym": "$", "name": "Chilean Peso"},
+  "COP": {"exp": 2, "sym": "$", "name": "Colombian Peso"},
+  "RUB": {"exp": 2, "sym": "₽", "name": "Russian Ruble"},
+  "TRY": {"exp": 2, "sym": "₺", "name": "Turkish Lira"},
+  "PLN": {"exp": 2, "sym": "zł", "name": "Zloty"},
+  "SEK": {"exp": 2, "sym": "kr", "name": "Swedish Krona"},
+  "NOK": {"exp": 2, "sym": "kr", "name": "Norwegian Krone"},
+  "DKK": {"exp": 2, "sym": "kr", "name": "Danish Krone"},
+  "CZK": {"exp": 2, "sym": "Kč", "name": "Czech Koruna"},
+  "HUF": {"exp": 2, "sym": "Ft", "name": "Forint"},
+  "RON": {"exp": 2, "sym": "lei", "name": "Romanian Leu"},
+  "AED": {"exp": 2, "sym": "د.إ", "name": "UAE Dirham"},
+  "SAR": {"exp": 2, "sym": "﷼", "name": "Saudi Riyal"},
+  "QAR": {"exp": 2, "sym": "﷼", "name": "Qatari Rial"},
+  "ILS": {"exp": 2, "sym": "₪", "name": "New Israeli Sheqel"},
+  "KRW": {"exp": 0, "sym": "₩", "name": "Won"},
+  "THB": {"exp": 2, "sym": "฿", "name": "Baht"},
+  "IDR": {"exp": 2, "sym": "Rp", "name": "Rupiah"},
+  "MYR": {"exp": 2, "sym": "RM", "name": "Malaysian Ringgit"},
+  "PHP": {"exp": 2, "sym": "₱", "name": "Philippine Peso"},
+  "VND": {"exp": 0, "sym": "₫", "name": "Dong"},
+  "PKR": {"exp": 2, "sym": "₨", "name": "Pakistan Rupee"},
+  "BDT": {"exp": 2, "sym": "৳", "name": "Taka"},
+  "BHD": {"exp": 3, "sym": ".د.ب", "name": "Bahraini Dinar"},
+  "KWD": {"exp": 3, "sym": "د.ك", "name": "Kuwaiti Dinar"},
+  "OMR": {"exp": 3, "sym": "ر.ع.", "name": "Rial Omani"},
+  "TND": {"exp": 3, "sym": "د.ت", "name": "Tunisian Dinar"},
+  "ISK": {"exp": 0, "sym": "kr", "name": "Iceland Krona"},
+  "BTC": {"exp": 8, "sym": "₿", "name": "Bitcoin"},
+  "USDT": {"exp": 6, "sym": "₮", "name": "Tether"},
+  "LARZ": {"exp": 8, "sym": "L", "name": "LarzCoin (testnet)"}
+}
+
+let _REGISTRY = {}
+
+# Add (or replace) a currency and return it. exponent = minor-unit
+# digits (2 for cents, 0 for yen, 3 for dinars).
+fn register(code, exponent, symbol=nil, name=nil) {
+  let c = code.upper()
+  let cur = {"code": c, "exponent": exponent, "symbol": symbol == nil ? c : symbol, "name": name == nil ? c : name}
+  _REGISTRY[c] = cur
+  return cur
+}
+
+# Look up a currency by code (case-insensitive). Throws if it's
+# neither registered nor in the built-in table.
+fn get_currency(code) {
+  let c = code.upper()
+  if _REGISTRY.has(c) { return _REGISTRY[c] }
+  if _TABLE.has(c) {
+    let t = _TABLE[c]
+    let cur = {"code": c, "exponent": t["exp"], "symbol": t["sym"], "name": t["name"]}
+    _REGISTRY[c] = cur
+    return cur
+  }
+  throw {"type": "LarzCurrencyError", "message": "unknown currency '" + code + "'; register it with money.register(...)"}
+}
+
+fn all_codes() {
+  let seen = {}
+  for k in keys(_TABLE) { seen[k] = true }
+  for k in keys(_REGISTRY) { seen[k] = true }
+  return sorted(keys(seen))
+}
+
+# ---- rounding ----
+
+let MODES = ["HALF_UP", "HALF_EVEN", "HALF_DOWN", "UP", "DOWN", "CEILING", "FLOOR"]
+
+# Rounds `v` (a possibly-fractional minor-unit count) to an integer
+# under the named mode. HALF_UP is the default everywhere below.
+fn _round_mode(v, mode) {
+  if mode == "CEILING" { return int(ceil(v)) }
+  if mode == "FLOOR" { return int(floor(v)) }
+  if mode == "UP" { return int(v >= 0 ? ceil(v) : floor(v)) }
+  if mode == "DOWN" { return int(v >= 0 ? floor(v) : ceil(v)) }
+  let lo = floor(v)
+  let hi = ceil(v)
+  if lo == hi { return int(lo) }
+  let d_lo = v - lo
+  let d_hi = hi - v
+  if d_lo < d_hi { return int(lo) }
+  if d_hi < d_lo { return int(hi) }
+  # exact tie
+  if mode == "HALF_UP" { return int(v > 0 ? hi : lo) }
+  if mode == "HALF_DOWN" { return int(v > 0 ? lo : hi) }
+  if mode == "HALF_EVEN" { return int(lo % 2 == 0 ? lo : hi) }
+  throw {"type": "LarzMoneyError", "message": "unknown rounding mode '" + mode + "'; use one of " + str(MODES)}
+}
+
+# ---- amount parsing ----
+
+fn _parse_amount(v) {
+  if type(v) == "number" { return v }
+  if type(v) != "string" { throw {"type": "LarzMoneyError", "message": "cannot use a " + type(v) + " as an amount"} }
+  let s = v.strip().replace(",", "")
+  if len(s) == 0 { return 0 }
+  return float(s)
+}
+
+# ---- construction ----
+
+fn zero(currency) { return {"units": 0, "currency": get_currency(currency)["code"]} }
+fn from_minor(minor_units, currency) { return {"units": int(minor_units), "currency": get_currency(currency)["code"]} }
+
+# Build from a human amount ("10.99", 10, "1,234.50"). If it has more
+# decimal places than the currency supports, rounds under `rounding`.
+fn of(amount, currency, rounding="HALF_UP") {
+  let cur = get_currency(currency)
+  let subunit = 10 ** cur["exponent"]
+  let raw = _parse_amount(amount) * subunit
+  return {"units": _round_mode(raw, rounding), "currency": cur["code"]}
+}
+
+# ---- accessors ----
+
+fn currency_of(m) { return get_currency(m["currency"]) }
+fn minor_units(m) { return m["units"] }
+fn amount(m) { return m["units"] / (10 ** currency_of(m)["exponent"]) }
+fn is_zero(m) { return m["units"] == 0 }
+fn is_positive(m) { return m["units"] > 0 }
+fn is_negative(m) { return m["units"] < 0 }
+fn sign(m) { return m["units"] > 0 ? 1 : (m["units"] < 0 ? -1 : 0) }
+
+fn _check_same(a, b, op) {
+  if a["currency"] != b["currency"] {
+    throw {"type": "LarzCurrencyMismatch", "message": op + " " + a["currency"] + " vs " + b["currency"] + " - convert first"}
+  }
+}
+
+# ---- arithmetic ----
+
+fn add(a, b) { _check_same(a, b, "add"); return {"units": a["units"] + b["units"], "currency": a["currency"]} }
+fn subtract(a, b) { _check_same(a, b, "subtract"); return {"units": a["units"] - b["units"], "currency": a["currency"]} }
+fn negate(m) { return {"units": -m["units"], "currency": m["currency"]} }
+fn abs_(m) { return {"units": m["units"] < 0 ? -m["units"] : m["units"], "currency": m["currency"]} }
+
+# Multiply by a scalar and round the result back to a whole minor unit -
+# the point where money leaves the integer grid (tax, interest, %).
+fn multiply(m, factor, rounding="HALF_UP") {
+  return {"units": _round_mode(m["units"] * _parse_amount(factor), rounding), "currency": m["currency"]}
+}
+
+# For splitting a pot among N recipients WITHOUT losing a cent, use
+# split()/allocate() instead - plain division rounds and can leak.
+fn divide(m, divisor, rounding="HALF_UP") {
+  let d = _parse_amount(divisor)
+  if d == 0 { throw {"type": "LarzMoneyError", "message": "cannot divide money by zero"} }
+  return {"units": _round_mode(m["units"] / d, rounding), "currency": m["currency"]}
+}
+
+fn percent(m, pct, rounding="HALF_UP") { return multiply(m, _parse_amount(pct) / 100, rounding) }
+
+# Split into parts proportional to `ratios` such that the parts sum
+# back to EXACTLY the original - no cent created or lost. Each part is
+# floor(share), then the leftover minor units are handed out one at a
+# time, front to back (deterministic, always sums correctly).
+fn allocate(m, ratios) {
+  if len(ratios) == 0 { throw {"type": "LarzMoneyError", "message": "allocate needs at least one ratio"} }
+  let total = 0
+  for r in ratios { if r < 0 { throw {"type": "LarzMoneyError", "message": "allocation ratios must be non-negative"} } total = total + r }
+  if total == 0 { throw {"type": "LarzMoneyError", "message": "allocation ratios sum to zero"} }
+  let neg = m["units"] < 0
+  let remaining = neg ? -m["units"] : m["units"]
+  let parts = []
+  let allocated = 0
+  for r in ratios {
+    let share = int(floor(remaining * r / total))
+    parts.push(share)
+    allocated = allocated + share
+  }
+  let leftover = remaining - allocated
+  let i = 0
+  while leftover > 0 {
+    let idx = i % len(parts)
+    parts[idx] = parts[idx] + 1
+    leftover = leftover - 1
+    i = i + 1
+  }
+  let out = []
+  for p in parts { out.push({"units": neg ? -p : p, "currency": m["currency"]}) }
+  return out
+}
+
+# Split into n as-equal-as-possible parts summing to the original - the
+# first parts absorb the extra cents.
+fn split(m, n) {
+  if n <= 0 { throw {"type": "LarzMoneyError", "message": "split count must be a positive int"} }
+  let ratios = []
+  for _ in range(n) { ratios.push(1) }
+  return allocate(m, ratios)
+}
+
+# ---- comparison ----
+
+fn eq(a, b) { return a["currency"] == b["currency"] and a["units"] == b["units"] }
+fn lt(a, b) { _check_same(a, b, "compare"); return a["units"] < b["units"] }
+fn lte(a, b) { _check_same(a, b, "compare"); return a["units"] <= b["units"] }
+fn gt(a, b) { _check_same(a, b, "compare"); return a["units"] > b["units"] }
+fn gte(a, b) { _check_same(a, b, "compare"); return a["units"] >= b["units"] }
+
+# Sum a list of Money safely. With an empty list you must pass
+# `currency` so the zero has a unit. Mismatched currencies throw.
+fn sum_money(items, currency=nil) {
+  let total = nil
+  for m in items { total = total == nil ? m : add(total, m) }
+  if total == nil {
+    if currency == nil { throw {"type": "LarzMoneyError", "message": "cannot sum an empty list without a currency"} }
+    return zero(currency)
+  }
+  return total
+}
+
+# ---- formatting & serialization ----
+
+fn format(m, symbol=true, grouping=true, code=false) {
+  let cur = currency_of(m)
+  let neg = m["units"] < 0
+  let u = neg ? -m["units"] : m["units"]
+  let digits = str(u)
+  while len(digits) < cur["exponent"] + 1 { digits = "0" + digits }
+  let whole = cur["exponent"] > 0 ? digits[0:len(digits) - cur["exponent"]] : digits
+  let frac = cur["exponent"] > 0 ? digits[len(digits) - cur["exponent"]:] : ""
+  if grouping {
+    let groups = []
+    while len(whole) > 3 {
+      groups = [whole[len(whole) - 3:]] + groups
+      whole = whole[0:len(whole) - 3]
+    }
+    groups = [whole] + groups
+    whole = join(groups, ",")
+  }
+  let out = whole + (len(frac) > 0 ? "." + frac : "")
+  if symbol { out = cur["symbol"] + out }
+  if neg { out = "-" + out }
+  if code { out = out + " " + cur["code"] }
+  return out
+}
+
+fn str_(m) { return format(m, false, true, true) }
+
+fn to_dict(m) { return {"minor_units": m["units"], "currency": m["currency"], "amount": amount(m)} }
+fn from_dict(d) { return {"units": int(d["minor_units"]), "currency": get_currency(d["currency"])["code"]} }
+
+# ---- exchange rates ----
+
+# A table of rates against a single base currency: rate[X] = "how many
+# X you get for one base unit". Doesn't fetch rates itself - you supply
+# ones you trust, and it does exact conversion arithmetic.
+fn exchange_new(base) {
+  let b = get_currency(base)
+  return {"base": b["code"], "rates": {b["code"]: 1}}
+}
+
+fn exchange_add(fx, currency, rate) {
+  let cur = get_currency(currency)
+  let r = _parse_amount(rate)
+  if r <= 0 { throw {"type": "LarzMoneyError", "message": "exchange rate must be positive"} }
+  fx["rates"][cur["code"]] = r
+  return fx
+}
+
+fn exchange_rate(fx, frm, to_code) {
+  let f = get_currency(frm)["code"]
+  let t = get_currency(to_code)["code"]
+  if not fx["rates"].has(f) { throw {"type": "LarzMoneyError", "message": "no rate for " + f + " (base " + fx["base"] + ")"} }
+  if not fx["rates"].has(t) { throw {"type": "LarzMoneyError", "message": "no rate for " + t + " (base " + fx["base"] + ")"} }
+  return fx["rates"][t] / fx["rates"][f]
+}
+
+fn exchange_convert(fx, m, to_code, rounding="HALF_UP") {
+  let target = get_currency(to_code)
+  if target["code"] == m["currency"] { return m }
+  let factor = exchange_rate(fx, m["currency"], target["code"])
+  return of(amount(m) * factor, target["code"], rounding)
+}
