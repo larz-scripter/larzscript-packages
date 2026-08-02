@@ -1,0 +1,129 @@
+# orbits - real two-body orbital mechanics and rocket-propulsion math:
+# Kepler's third law, the vis-viva equation, escape velocity, the
+# Tsiolkovsky rocket equation, Hohmann transfers, and impact kinetic
+# energy. Every formula is checked in this package's tests against a
+# well-known real reference figure (the ISS's real orbital period, the
+# textbook LEO->GEO Hohmann transfer, Earth's real escape velocity, ...),
+# not just transcribed from a textbook and trusted.
+#
+#   import "orbits" as orbits
+#   orbits.orbital_period(6779) / 60          # ISS: ~92.7 minutes
+#   orbits.escape_velocity(orbits.EARTH_RADIUS_KM)  # ~11.19 km/s
+#   orbits.rocket_delta_v(4130, 50000, 12000) # m/s, Tsiolkovsky
+#   orbits.hohmann_transfer(6771, 42164)      # LEO -> GEO, ~3.86 km/s total
+
+let PI = 3.141592653589793
+
+# Standard gravitational parameters (mu = G*M), km^3/s^2 - these, not G
+# and mass separately, are the precisely-measured quantities astrodynamics
+# actually uses.
+let MU_EARTH = 398600.4418
+let MU_SUN = 132712440018.0
+let MU_MOON = 4902.800066
+
+let EARTH_RADIUS_KM = 6371.0
+let AU_KM = 149597870.7
+let G0 = 9.80665          # standard gravity, m/s^2 - for Isp -> exhaust velocity
+let TNT_JOULES_PER_KT = 4184000000000.0
+
+# Natural log via bisection solve of e^y = x - `**` only takes whole-number
+# exponents so there's no builtin log to lean on. Same technique as the
+# `search` package's BM25 ln(), kept local so orbits has no dependency.
+fn _exp(y) {
+  let whole = int(y)
+  if y < 0 and whole != y { whole = whole - 1 }
+  let frac = y - whole
+  let e_const = 2.718281828459045
+  let base = 1.0
+  let k = 0
+  while k < (whole < 0 ? -whole : whole) {
+    base = whole < 0 ? base / e_const : base * e_const
+    k = k + 1
+  }
+  let term = 1.0
+  let total = 1.0
+  let n = 1
+  while n < 30 { term = term * frac / n; total = total + term; n = n + 1 }
+  return base * total
+}
+
+fn ln(x) {
+  if x <= 0 { throw {"type": "LarzValueError", "message": "ln() needs a positive number"} }
+  let lo = -50.0
+  let hi = 50.0
+  let i = 0
+  while i < 100 {
+    let mid = (lo + hi) / 2
+    if _exp(mid) < x { lo = mid } else { hi = mid }
+    i = i + 1
+  }
+  return (lo + hi) / 2
+}
+
+# --- Orbits (all distances km, mu km^3/s^2, times seconds, velocities km/s) ---
+
+# Kepler's third law: the orbital period of a body on a circular or
+# elliptical orbit of semi-major axis `a_km`, independent of eccentricity.
+fn orbital_period(a_km, mu=MU_EARTH) {
+  return 2 * PI * sqrt(pow(a_km, 3) / mu)
+}
+
+# The vis-viva equation: instantaneous orbital speed at radius `r_km` on
+# an orbit of semi-major axis `a_km`. Circular and escape velocity below
+# are both special cases of this one equation (a_km == r_km, and
+# a_km == infinity respectively).
+fn vis_viva(r_km, a_km, mu=MU_EARTH) {
+  return sqrt(mu * (2 / r_km - 1 / a_km))
+}
+
+fn circular_velocity(r_km, mu=MU_EARTH) { return sqrt(mu / r_km) }
+
+fn escape_velocity(r_km, mu=MU_EARTH) { return sqrt(2 * mu / r_km) }
+
+fn altitude_to_radius(altitude_km, body_radius_km=EARTH_RADIUS_KM) {
+  return body_radius_km + altitude_km
+}
+
+# The two burns of a Hohmann transfer between two circular orbits: raise
+# apoapsis at r1 to reach r2 (or lower periapsis, if r2 < r1), coast half
+# the transfer ellipse, then circularize at r2. Returns each burn's
+# delta-v, their sum, and the coast time - the standard minimum-energy
+# two-impulse transfer between coplanar circular orbits.
+fn hohmann_transfer(r1_km, r2_km, mu=MU_EARTH) {
+  let a_transfer = (r1_km + r2_km) / 2
+  let v1_circ = circular_velocity(r1_km, mu)
+  let v2_circ = circular_velocity(r2_km, mu)
+  let v_transfer_at_r1 = vis_viva(r1_km, a_transfer, mu)
+  let v_transfer_at_r2 = vis_viva(r2_km, a_transfer, mu)
+  let dv1 = v_transfer_at_r1 - v1_circ
+  let dv2 = v2_circ - v_transfer_at_r2
+  return {
+    "dv1_km_s": dv1,
+    "dv2_km_s": dv2,
+    "dv_total_km_s": (dv1 < 0 ? -dv1 : dv1) + (dv2 < 0 ? -dv2 : dv2),
+    "transfer_time_s": PI * sqrt(pow(a_transfer, 3) / mu),
+  }
+}
+
+# --- Propulsion (masses kg, velocities m/s) ---
+
+fn isp_to_exhaust_velocity(isp_s) { return isp_s * G0 }
+
+# Tsiolkovsky rocket equation: the delta-v a rocket gets from burning
+# from `mass_wet_kg` (with propellant) down to `mass_dry_kg` (without),
+# at exhaust velocity `exhaust_velocity_ms`.
+fn rocket_delta_v(exhaust_velocity_ms, mass_wet_kg, mass_dry_kg) {
+  return exhaust_velocity_ms * ln(mass_wet_kg / mass_dry_kg)
+}
+
+# The inverse: how much propellant mass is needed on top of `mass_dry_kg`
+# to achieve `delta_v_ms` at the given exhaust velocity.
+fn rocket_propellant_mass(delta_v_ms, exhaust_velocity_ms, mass_dry_kg) {
+  return mass_dry_kg * (_exp(delta_v_ms / exhaust_velocity_ms) - 1)
+}
+
+# --- Impact energy (masses kg, velocities m/s) ---
+
+fn kinetic_energy_j(mass_kg, velocity_ms) { return 0.5 * mass_kg * velocity_ms * velocity_ms }
+
+fn joules_to_kilotons_tnt(joules) { return joules / TNT_JOULES_PER_KT }
