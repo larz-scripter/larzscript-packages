@@ -184,11 +184,20 @@ fn _lut_lookup(lut, env_linear) {
   return lut[idx]
 }
 
-fn compressor_process(c, x) {
-  let level = x < 0 ? -x : x
+# Updates the envelope from `level` and returns the gain for it, without
+# tying that gain to one specific sample - the building block for a
+# LINKED stereo compressor (feed it max(|L|, |R|) once per frame, apply
+# the one returned gain to both channels, so the stereo image doesn't
+# wobble the way independently-compressed L/R would).
+fn compressor_gain(c, level) {
   let coeff = level > c["env"] ? c["attack"] : c["release"]
   c["env"] = c["env"] * coeff + level * (1 - coeff)
-  let gain = _lut_lookup(c["lut"], c["env"])
+  return _lut_lookup(c["lut"], c["env"])
+}
+
+fn compressor_process(c, x) {
+  let level = x < 0 ? -x : x
+  let gain = compressor_gain(c, level)
   return x * gain
 }
 
