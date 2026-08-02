@@ -24,40 +24,53 @@ forward - one tunnel reaches your whole reachable network).
 error markers (`ssh -N` is silent on success, so there's no exit code to
 wait on), and reconnects with exponential backoff.
 
-## One script that does everything
+## One script, one password, done
 
-[`examples/setup_and_test.lz`](examples/setup_and_test.lz) - fill in 4
-lines at the top (your relay's address and a one-time-root SSH alias to
-it), run it, done: generates the client key if it doesn't have one yet,
-configures the relay (idempotent - safe to run every time), starts the
-tunnel in the background, then actually **tests** it - connects through
-the relay and checks for a real SSH banner, prints PASS/FAIL instead of
-just claiming success. Verified against a real VPS, twice in a row,
-before publishing this:
+[`examples/password_setup.lz`](examples/password_setup.lz) - the
+fastest path if you just have a fresh relay and its root password. Fill
+in 4 lines at the top (host, port, root password), run it: generates its
+own client key, uses the password **once** to create a locked-down
+`tunnel` user on the relay (no shell, no X11/agent forwarding - real
+setup, not a stub), then connects and stays connected with real
+auto-reconnect (`netbridge.supervise()`, not a one-shot attempt that
+dies on the first hiccup). The password is never needed again after
+that one run - every reconnect after uses the key it generated.
+
+```
+larzscript pkg install netbridge
+nohup larzscript password_setup.lz > ~/netbridge.log 2>&1 &
+```
+
+Needs [`sshpass`](https://linux.die.net/man/1/sshpass) for the one-time
+password step (`apt install sshpass`) - the only extra dependency, and
+only for that one line.
+
+Verified from a completely clean slate against a real VPS - no key, no
+`tunnel` user, nothing - three separate times before publishing this,
+each one ending with a real SSH banner confirmed back through the
+tunnel (not a stub, and not the same banner every time - dropbear,
+because that's what the real machine tunneled to was actually running):
 
 ```
 ==> client key
-already have /home/elevenace/.ssh/netbridge_key
-==> configuring relay (larzserver)
+generated /home/you/.ssh/netbridge_key
+==> setting up the relay (password, one time only)
 RELAY_SETUP_OK
-
-==> starting tunnel
+==> connecting (auto-reconnects if the relay or network hiccups)
 relay:2200  ->  127.0.0.1:22
-==> testing connection through the relay
-received: SSH-2.0-dropbear_2017.75
-
-PASS - the tunnel is live. From the relay: ssh -p 2200 you@127.0.0.1
 ```
 
-(that `SSH-2.0-dropbear_2017.75` is real too - the actual banner the
-client machine's own `sshd` sent back, dropbear rather than OpenSSH on
-that particular box. Yours will show whatever your client runs.)
+(from the relay: `ssh -p 2200 you@127.0.0.1` now lands on the client
+machine's real `sshd`.)
 
-## Setting up a real relay, by hand
+## Setting up a real relay by hand, with your own SSH key
 
-The same thing as the one-shot script above, broken into its three
-individual steps - useful if you want to understand or customize each
-piece rather than run the all-in-one version.
+If you'd rather not put a root password in a script - the same setup,
+authenticated with an SSH key you already have instead:
+[`examples/setup_and_test.lz`](examples/setup_and_test.lz) (fill in a
+`~/.ssh/config` alias with root access instead of a password) also
+self-tests before reporting success. Or broken into its three individual
+steps below, if you want to understand or customize each piece.
 
 **1. On the machine you want to expose** (the "client" - wherever this
 runs FROM):
