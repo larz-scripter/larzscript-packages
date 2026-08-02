@@ -1,0 +1,436 @@
+# psktunnel - remote exec + TCP forwarding through a relay, in pure
+# Larzscript on both ends. No ssh/sshd/sshpass, nothing to install beyond
+# larzscript itself and this package. NOT SSH - doesn't speak RFC 4253,
+# won't interoperate with real sshd/OpenSSH/dropbear. A different, honestly
+# named protocol built entirely on primitives Larzscript actually has:
+# HMAC-SHA256 AEAD (crypto.aead_encrypt/decrypt) under a key derived from a
+# password both sides already know (crypto.pbkdf2) - no elliptic-curve/
+# big-integer key exchange, because Larzscript's crypto package can't
+# honestly do that (see crypto's own README).
+#
+# Two roles:
+#   relay_daemon(cfg)  - runs on a public server, stays up (nohup/systemd).
+#   run_client(cfg)    - runs on the machine you want to expose, dials OUT
+#                        to the relay (works through NAT/CGNAT, same as
+#                        netbridge's reverse-tunnel model).
+#
+# Both sides need the same master_key, from the same password:
+#   let key = psktunnel.derive_key("a shared password")
+#
+# Capabilities: exec(cmd) (relay -> client, request/response, via the admin
+# port) and forward (one active forwarded TCP connection at a time - v1
+# scope, matches the `tcp` package's own "not concurrent" precedent).
+#
+# larzscript pkg install psktunnel
+
+import "crypto" as crypto
+import "json" as json
+import "tcp" as tcp
+
+# ---- key derivation ----
+
+# Turns a shared password into the long-term key both sides use. HMAC-SHA256
+# based (crypto has no Argon2/bcrypt) and iterations are kept modest -
+# crypto's own docs note ~0.5s/iteration on this interpreter, so this is a
+# real but deliberately-bounded KDF cost, not a production-grade one. Stated
+# plainly: this is meaningfully weaker than Argon2/bcrypt against an
+# attacker who captures the derivation and brute-forces offline.
+fn derive_key(password, iterations=20) {
+  return crypto.pbkdf2(password, "psktunnel-v1", iterations)
+}
+
+fn default_config() {
+  return {
+    "relay_host": "203.0.113.10",
+    "control_port": 7040,
+    "data_port": 7041,
+    "admin_port": 7042,
+    "forward_public_port": 0,     # 0 = exec only, no port forwarding
+    "target_host": "127.0.0.1",
+    "target_port": 22,
+    "master_key": "",
+    "retry_min": 2,
+    "retry_max": 30,
+  }
+}
+
+# ---- wire framing: 10-ASCII-digit decimal length + seq|ciphertext_hex|mac_hex ----
+#
+# Deliberately NOT raw binary bytes (e.g. a 4-byte big-endian length): this
+# interpreter's strings are NUL-terminated C strings under the hood -
+# len()/`for`-in/concatenation all go through strlen() (native/larzscript.c,
+# bi_len: `strlen(args[0].str)`), so a raw byte value of 0 anywhere in a
+# "string" silently truncates everything after it - even chr(0) alone comes
+# back as a zero-length value. A fixed-width decimal prefix is pure ASCII
+# digits (0x30-0x39), never 0x00, so it's immune to that entirely.
+fn _len_prefix(n) {
+  let s = str(n)
+  while len(s) < 10 { s = "0" + s }
+  return s
+}
+fn _len_from_prefix(s) { return int(s) }
+
+fn _read_exact(fd, n) {
+  let buf = ""
+  while len(buf) < n {
+    let chunk = socket_read(fd, n - len(buf))
+    if chunk == "" { throw {"type": "PsktunnelError", "message": "connection closed mid-frame"} }
+    buf = buf + chunk
+  }
+  return buf
+}
+
+fn _read_frame_body(fd) {
+  let len_bytes = _read_exact(fd, 10)
+  return _read_exact(fd, _len_from_prefix(len_bytes))
+}
+
+# A keystream, like crypto's own _aead_keystream, but starting the HMAC
+# counter at an arbitrary offset instead of always 0 - lets many messages
+# share one key_enc while each still gets its own non-overlapping slice of
+# keystream (see _chan_send/_chan_recv below for why that matters).
+fn _keystream_from(key_enc, start_counter, n) {
+  let out = []
+  let counter = start_counter
+  while len(out) < n {
+    for b in crypto.hmac_bytes(key_enc, str(counter)) { out.push(b) }
+    counter = counter + 1
+  }
+  return out[0:n]
+}
+
+# Plenty of room: no single message this protocol sends (control messages,
+# one forwarded-data chunk) gets anywhere near 1M bytes, and hmac_bytes()
+# produces 32 bytes/call, so consecutive sequence numbers' keystream
+# regions (seq * this) never overlap.
+let _KEYSTREAM_STRIDE = 1000000
+
+# A "channel": one live socket, its two derived keys, and per-direction
+# sequence counters. `my_dir`/`peer_dir` are "c2r"/"r2c" (swapped depending
+# on which side you're on).
+#
+# key_enc/key_mac are derived ONCE here, not per message: crypto.aead_encrypt
+# re-deriving both from scratch on every call (plus this package originally
+# adding a THIRD per-packet key layer on top) measured at ~3.8s to encrypt
+# ONE short message on this interpreter's hand-rolled SHA256 - unusable for
+# anything resembling interactive use. Reusing key_enc across messages is
+# safe here specifically because _chan_send gives every sequence number its
+# own non-overlapping keystream slice (via _keystream_from's counter
+# offset) instead of relying on a fresh key to avoid reuse - the standard
+# way real stream ciphers avoid this (vary the counter/nonce, not the key),
+# just implemented with what this interpreter's crypto package actually
+# has. Measured ~2.5x faster per message this way (see README for the
+# actual numbers) - still real seconds, not milliseconds, because the
+# floor is this interpreter's own SHA256 cost, not the design.
+fn _new_chan(fd, key, my_dir, peer_dir) {
+  # Values computed into locals first, not inline in the dict literal below -
+  # a dict literal with a cross-module call as a value can corrupt keys on
+  # this interpreter after heavy prior allocation (filed as larzscript#4).
+  let send_key_enc = crypto.hmac(key, my_dir + ":enc")
+  let send_key_mac = crypto.hmac(key, my_dir + ":mac")
+  let recv_key_enc = crypto.hmac(key, peer_dir + ":enc")
+  let recv_key_mac = crypto.hmac(key, peer_dir + ":mac")
+  return {
+    "fd": fd,
+    "send_key_enc": send_key_enc,
+    "send_key_mac": send_key_mac,
+    "recv_key_enc": recv_key_enc,
+    "recv_key_mac": recv_key_mac,
+    "my_dir": my_dir, "peer_dir": peer_dir, "send_n": 0, "recv_n": 0,
+  }
+}
+
+fn _chan_send(chan, plaintext) {
+  let seq = chan["send_n"]
+  if len(plaintext) >= _KEYSTREAM_STRIDE {
+    throw {"type": "PsktunnelError", "message": "message too large for one frame (" + str(len(plaintext)) + " bytes)"}
+  }
+  let tag = chan["my_dir"] + ":" + str(seq)
+  let plain_bytes = crypto.str_to_bytes(plaintext)
+  let ciphertext_bytes = crypto._aead_xor(plain_bytes, _keystream_from(chan["send_key_enc"], seq * _KEYSTREAM_STRIDE, len(plain_bytes)))
+  let ciphertext_hex = crypto._aead_to_hex(ciphertext_bytes)
+  let mac = crypto.hmac(chan["send_key_mac"], ciphertext_hex + "|" + tag)
+  let body = str(seq) + "|" + ciphertext_hex + "|" + mac
+  tcp.write_all(chan["fd"], _len_prefix(len(body)) + body)
+  chan["send_n"] = seq + 1
+}
+
+fn _chan_recv(chan) {
+  let body = _read_frame_body(chan["fd"])
+  let parts = body.split("|")
+  let seq = int(parts[0])
+  if seq != chan["recv_n"] {
+    throw {"type": "PsktunnelError", "message": "sequence mismatch (got " + str(seq) + ", wanted " + str(chan["recv_n"]) + ") - replay or desync"}
+  }
+  let tag = chan["peer_dir"] + ":" + str(seq)
+  let ciphertext_hex = parts[1]
+  let expected_mac = crypto.hmac(chan["recv_key_mac"], ciphertext_hex + "|" + tag)
+  if not crypto._aead_secure_equal(expected_mac, parts[2]) {
+    throw {"type": "PsktunnelError", "message": "wrong key or tampered frame"}
+  }
+  let ciphertext_bytes = crypto._aead_from_hex(ciphertext_hex)
+  let plain_bytes = crypto._aead_xor(ciphertext_bytes, _keystream_from(chan["recv_key_enc"], seq * _KEYSTREAM_STRIDE, len(ciphertext_bytes)))
+  let out = ""
+  for b in plain_bytes { out = out + chr(b) }
+  chan["recv_n"] = seq + 1
+  return out
+}
+
+fn _chan_send_msg(chan, msg) { _chan_send(chan, json.stringify(msg)) }
+fn _chan_recv_msg(chan) { return json.parse(_chan_recv(chan)) }
+
+# Per-forwarded-connection key, so a data connection's traffic is never
+# encrypted under the same key (and thus never the same keystream space) as
+# the control connection or any other forwarded connection.
+fn _conn_key(master_key, conn_id) { return crypto.hmac(master_key, "conn:" + str(conn_id)) }
+
+fn _close_pair(a_fd, b_fd) {
+  try { socket_close(a_fd) } catch e {}
+  try { socket_close(b_fd) } catch e {}
+}
+
+# ==================== client (the exposed machine) ====================
+
+fn _client_control_handshake(fd, cfg) {
+  let chan = _new_chan(fd, cfg["master_key"], "c2r", "r2c")
+  _chan_send_msg(chan, {
+    "type": "hello",
+    "forward_public_port": cfg["forward_public_port"],
+    "target_host": cfg["target_host"],
+    "target_port": cfg["target_port"],
+  })
+  let reply = _chan_recv_msg(chan)
+  if reply["type"] != "hello_ok" {
+    throw {"type": "PsktunnelError", "message": "relay rejected hello: " + json.stringify(reply)}
+  }
+  return chan
+}
+
+fn _client_open_forward(cfg, conn_id) {
+  let local_fd = socket_connect(cfg["target_host"], cfg["target_port"])
+  let data_fd = socket_connect(cfg["relay_host"], cfg["data_port"])
+  let hello_chan = _new_chan(data_fd, cfg["master_key"], "c2r", "r2c")
+  _chan_send_msg(hello_chan, {"type": "data-hello", "conn_id": conn_id})
+  let data_chan = _new_chan(data_fd, _conn_key(cfg["master_key"], conn_id), "c2r", "r2c")
+  return {"local_fd": local_fd, "data_fd": data_fd, "data_chan": data_chan}
+}
+
+fn _client_session_once(cfg, opts) {
+  let fd = socket_connect(cfg["relay_host"], cfg["control_port"])
+  let chan = _client_control_handshake(fd, cfg)
+  let log = opts["log_fn"]
+  log("connected to relay - tunnel active")
+  let active = nil
+  # Everything below is wrapped so ANY error still closes the control
+  # socket before this function returns - without this, a client-side
+  # error (e.g. its own local target refusing a connection) left the
+  # relay's control socket open with nobody reading it, so the relay
+  # never saw the disconnect, never returned to accepting a new client,
+  # and a subsequent reconnect attempt just sat in the TCP listen
+  # backlog forever with no response. Found via a real end-to-end test,
+  # not assumed.
+  try {
+    while true {
+      let watch = [chan["fd"]]
+      if active != nil { watch.push(active["local_fd"]); watch.push(active["data_fd"]) }
+      let ready = socket_poll(watch, 200)
+
+      if ready.contains(chan["fd"]) {
+        let msg = _chan_recv_msg(chan)
+        if msg["type"] == "ping" { _chan_send_msg(chan, {"type": "pong"}) }
+        if msg["type"] == "exec" {
+          let output = capture(msg["cmd"] + " 2>&1")
+          _chan_send_msg(chan, {"type": "exec_result", "output": output})
+        }
+        if msg["type"] == "open" and active == nil {
+          active = _client_open_forward(cfg, msg["conn_id"])
+          log("forward: connection " + str(msg["conn_id"]) + " open")
+        }
+      }
+      if active != nil and ready.contains(active["local_fd"]) {
+        let data = socket_read(active["local_fd"], 16384)
+        if data == "" {
+          _close_pair(active["local_fd"], active["data_fd"]); active = nil
+        } else {
+          try { _chan_send(active["data_chan"], data) } catch e { _close_pair(active["local_fd"], active["data_fd"]); active = nil }
+        }
+      }
+      if active != nil and ready.contains(active["data_fd"]) {
+        try {
+          let data = _chan_recv(active["data_chan"])
+          tcp.write_all(active["local_fd"], data)
+        } catch e { _close_pair(active["local_fd"], active["data_fd"]); active = nil }
+      }
+    }
+  } catch e {
+    socket_close(fd)
+    if active != nil { _close_pair(active["local_fd"], active["data_fd"]) }
+    throw e
+  }
+}
+
+# Runs forever: connects, serves exec + forward requests, and on any error
+# (relay unreachable, connection dropped) reconnects with exponential
+# backoff between retry_min and retry_max seconds.
+fn run_client(cfg, opts={}) {
+  if not opts.has("log_fn") { opts["log_fn"] = fn(line) { print(line) } }
+  let log = opts["log_fn"]
+  let delay = cfg["retry_min"]
+  while true {
+    try {
+      _client_session_once(cfg, opts)
+    } catch e {
+      log("session ended: " + json.stringify(e))
+    }
+    log("reconnecting in " + str(delay) + "s...")
+    sleep(delay)
+    delay = delay * 2
+    if delay > cfg["retry_max"] { delay = cfg["retry_max"] }
+  }
+}
+
+# ==================== relay (the public, always-on side) ====================
+
+fn _relay_accept_client(control_listener, master_key) {
+  let client_fd = socket_accept(control_listener)
+  let chan = _new_chan(client_fd, master_key, "r2c", "c2r")
+  let hello = nil
+  try {
+    hello = _chan_recv_msg(chan)
+  } catch e {
+    socket_close(client_fd)
+    throw {"type": "PsktunnelError", "message": "handshake failed (wrong master_key?): " + json.stringify(e)}
+  }
+  if hello["type"] != "hello" {
+    socket_close(client_fd)
+    throw {"type": "PsktunnelError", "message": "unexpected first message"}
+  }
+  _chan_send_msg(chan, {"type": "hello_ok"})
+  return {"chan": chan, "hello": hello}
+}
+
+fn _relay_serve_session(chan, hello, data_listener, admin_listener, master_key, log) {
+  let forward_listener = nil
+  let fwd_port = hello["forward_public_port"]
+  if fwd_port and fwd_port > 0 {
+    forward_listener = socket_listen(fwd_port)
+    log("forwarding relay:" + str(fwd_port) + " -> client's " + hello["target_host"] + ":" + str(hello["target_port"]))
+  }
+  let next_conn_id = 1
+  let active = nil   # {"ext_fd", "data_fd", "data_chan"} - one at a time, v1 scope
+
+  # Wrapped for the same reason as the client's main loop: on any error,
+  # close the control socket AND the forward listener (an unclosed
+  # forward_listener would make the NEXT session's socket_listen(fwd_port)
+  # fail with "address already in use") before this function returns.
+  try {
+    while true {
+      let watch = [chan["fd"], admin_listener]
+      if forward_listener != nil and active == nil { watch.push(forward_listener) }
+      if active != nil { watch.push(active["ext_fd"]); watch.push(active["data_fd"]) }
+      let ready = socket_poll(watch, 200)
+
+      if ready.contains(chan["fd"]) {
+        _chan_recv_msg(chan)   # only pong-less pings expected from client right now; read to keep the stream in sync
+      }
+
+      if ready.contains(admin_listener) {
+        let admin_fd = socket_accept(admin_listener)
+        let cmd = _read_frame_body(admin_fd)
+        _chan_send_msg(chan, {"type": "exec", "cmd": cmd})
+        let result = _chan_recv_msg(chan)
+        let out = result["output"]
+        tcp.write_all(admin_fd, _len_prefix(len(out)) + out)
+        socket_close(admin_fd)
+      }
+
+      if forward_listener != nil and active == nil and ready.contains(forward_listener) {
+        let ext_fd = socket_accept(forward_listener)
+        let conn_id = next_conn_id
+        next_conn_id = next_conn_id + 1
+        _chan_send_msg(chan, {"type": "open", "conn_id": conn_id})
+        # Generous, not arbitrary: the client has to receive+decrypt "open",
+        # dial out twice, and stand up two fresh channels (each ~6s on this
+        # interpreter's SHA256 - see _new_chan) before its data connection
+        # even reaches this listener. 10s measured as too tight in testing.
+        let ready2 = socket_poll([data_listener], 60000)
+        if len(ready2) == 0 {
+          log("forward: client did not open a data connection in time")
+          socket_close(ext_fd)
+        } else {
+          let data_fd = socket_accept(data_listener)
+          let hello_chan = _new_chan(data_fd, master_key, "r2c", "c2r")
+          let data_hello = _chan_recv_msg(hello_chan)
+          if data_hello["type"] != "data-hello" or data_hello["conn_id"] != conn_id {
+            log("forward: data connection didn't match conn_id - closing")
+            _close_pair(data_fd, ext_fd)
+          } else {
+            let data_chan = _new_chan(data_fd, _conn_key(master_key, conn_id), "r2c", "c2r")
+            active = {"ext_fd": ext_fd, "data_fd": data_fd, "data_chan": data_chan}
+            log("forward: connection " + str(conn_id) + " bridged")
+          }
+        }
+      }
+
+      if active != nil and ready.contains(active["ext_fd"]) {
+        let data = socket_read(active["ext_fd"], 16384)
+        if data == "" {
+          _close_pair(active["ext_fd"], active["data_fd"]); active = nil
+        } else {
+          try { _chan_send(active["data_chan"], data) } catch e { _close_pair(active["ext_fd"], active["data_fd"]); active = nil }
+        }
+      }
+      if active != nil and ready.contains(active["data_fd"]) {
+        try {
+          let data = _chan_recv(active["data_chan"])
+          tcp.write_all(active["ext_fd"], data)
+        } catch e { _close_pair(active["ext_fd"], active["data_fd"]); active = nil }
+      }
+    }
+  } catch e {
+    socket_close(chan["fd"])
+    if forward_listener != nil { socket_close(forward_listener) }
+    if active != nil { _close_pair(active["ext_fd"], active["data_fd"]) }
+    throw e
+  }
+}
+
+# Runs forever: accepts one client at a time (the machine being exposed),
+# serves its exec + forward traffic until it disconnects, then waits for
+# the next connection (or a reconnect from the same client).
+fn relay_daemon(cfg, opts={}) {
+  if not opts.has("log_fn") { opts["log_fn"] = fn(line) { print(line) } }
+  let log = opts["log_fn"]
+  let control_listener = socket_listen(cfg["control_port"])
+  let data_listener = socket_listen(cfg["data_port"])
+  let admin_listener = socket_listen(cfg["admin_port"])
+  log("psktunnel relay: control=" + str(cfg["control_port"]) + " data=" + str(cfg["data_port"]) + " admin=" + str(cfg["admin_port"]) + " (point relay_exec() at 127.0.0.1:" + str(cfg["admin_port"]) + ")")
+  while true {
+    log("waiting for client...")
+    let accepted = nil
+    try {
+      accepted = _relay_accept_client(control_listener, cfg["master_key"])
+    } catch e {
+      log("client rejected: " + json.stringify(e))
+      continue
+    }
+    log("client connected: " + json.stringify(accepted["hello"]))
+    try {
+      _relay_serve_session(accepted["chan"], accepted["hello"], data_listener, admin_listener, cfg["master_key"], log)
+    } catch e {
+      log("session ended: " + json.stringify(e))
+    }
+  }
+}
+
+# Convenience for an operator: run this from a short-lived script on (or
+# tunneled into) the relay box to have the tunneled client run `cmd` and
+# return its output. Talks to relay_daemon()'s local admin port - plaintext,
+# 127.0.0.1-only by convention (bind it there, don't expose admin_port).
+fn relay_exec(admin_host, admin_port, cmd) {
+  let fd = socket_connect(admin_host, admin_port)
+  tcp.write_all(fd, _len_prefix(len(cmd)) + cmd)
+  let out = _read_frame_body(fd)
+  socket_close(fd)
+  return out
+}

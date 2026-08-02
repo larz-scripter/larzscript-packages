@@ -1,0 +1,34 @@
+# client.lz - run this on the machine you want to expose (works behind
+# NAT/CGNAT - it dials OUT to the relay, nothing needs to be reachable
+# here). Fill in PASSWORD (must match relay_daemon.lz's PASSWORD) and
+# RELAY_HOST, then:
+#
+#   larzscript pkg install psktunnel
+#   nohup larzscript client.lz > ~/psktunnel-client.log 2>&1 &
+#
+# Needs nothing else installed - no sshd, no OpenSSH, works the same way
+# on Linux, macOS, and Windows as long as larzscript itself is installed.
+# See this package's README for real, measured latency numbers - this is
+# NOT interactive-speed (budget 15-20+ seconds per exec() call, and
+# forward() isn't usable for a live session).
+
+import "psktunnel" as psk
+
+let PASSWORD = "change-me"          # must match relay_daemon.lz's PASSWORD
+let RELAY_HOST = "203.0.113.10"     # your relay's address or hostname
+let CONTROL_PORT = 7040
+let DATA_PORT = 7041
+let FORWARD_PUBLIC_PORT = 2200      # 0 = exec only, no forwarding
+let TARGET_HOST = "127.0.0.1"       # the local service to expose...
+let TARGET_PORT = 22                # ...and its port
+
+let cfg = psk.default_config()
+cfg["relay_host"] = RELAY_HOST
+cfg["control_port"] = CONTROL_PORT
+cfg["data_port"] = DATA_PORT
+cfg["forward_public_port"] = FORWARD_PUBLIC_PORT
+cfg["target_host"] = TARGET_HOST
+cfg["target_port"] = TARGET_PORT
+cfg["master_key"] = psk.derive_key(PASSWORD)
+
+psk.run_client(cfg)

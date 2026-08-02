@@ -1,0 +1,30 @@
+# relay_daemon.lz - run this on a public server, keep it running (nohup or
+# a systemd unit). Fill in PASSWORD (needs to match client.lz's PASSWORD -
+# same shared password on both sides, that's the whole setup) and run:
+#
+#   larzscript pkg install psktunnel
+#   nohup larzscript relay_daemon.lz > ~/psktunnel-relay.log 2>&1 &
+#
+# Needs nothing else installed - no sshd, no OpenSSH. See this package's
+# README for real, measured latency numbers before relying on this for
+# anything time-sensitive.
+
+import "psktunnel" as psk
+
+let PASSWORD = "change-me"          # must match client.lz's PASSWORD
+let CONTROL_PORT = 7040             # the client dials out to this
+let DATA_PORT = 7041                # internal - forwarded connections use this
+let ADMIN_PORT = 7042               # 127.0.0.1-only - relay_exec() talks here
+
+# Note: FORWARD_PUBLIC_PORT is set on the CLIENT side (client.lz), not
+# here - the client tells the relay what to open when it connects, the
+# same way `ssh -R` specifies the forward from the client end, not sshd's
+# config. This side only needs the three ports above and the password.
+
+let cfg = psk.default_config()
+cfg["control_port"] = CONTROL_PORT
+cfg["data_port"] = DATA_PORT
+cfg["admin_port"] = ADMIN_PORT
+cfg["master_key"] = psk.derive_key(PASSWORD)
+
+psk.relay_daemon(cfg)
