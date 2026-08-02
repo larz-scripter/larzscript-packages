@@ -189,6 +189,8 @@ Larzscript, one per Larz Stack library slot (`larzcart` -> `cart`, etc.):
 | [dispatch](packages/dispatch) | a multi-tenant outbound webhook registry, N destinations, one backend |
 | [orbits](packages/orbits) | real two-body orbital mechanics + the Tsiolkovsky rocket equation |
 | [neows](packages/neows) | a real client for NASA's live Near-Earth-Object tracking feed |
+| [dsp](packages/dsp) | biquad EQ, LUT compressor, limiter, peak/RMS/normalize - real audio DSP |
+| [wav](packages/wav) | read/write real WAV (RIFF/PCM) files |
 
 ## Adding a package
 

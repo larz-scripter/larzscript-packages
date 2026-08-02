@@ -1,0 +1,111 @@
+# wav - read and write real WAV (RIFF/PCM) files, pure Larzscript. Audio
+# content is a list of floats in [-1, 1] (mono: one value per sample;
+# stereo: interleaved L, R, L, R, ...) - the same convention `dsp` buffers
+# use, so the two packages compose directly. Files are built/parsed as
+# byte lists (ints 0-255) via `write_file()`/`read_file_bytes()`'s
+# binary-safe contract - a WAV header is full of 0x00 bytes, so building
+# one through string concatenation would silently truncate (see
+# `archive`'s docstring for the same warning). 16-bit PCM only.
+#
+#   import "wav" as wav
+#   wav.write("tone.wav", samples, 22050)          # mono, 16-bit
+#   let w = wav.read("tone.wav")
+#   print(w["sample_rate"], w["channels"], len(w["samples"]))
+
+fn _u16le(n) { return [n % 256, (n // 256) % 256] }
+fn _u32le(n) { return [n % 256, (n // 256) % 256, (n // 65536) % 256, (n // 16777216) % 256] }
+fn _str_bytes(s) { let out = []; for c in s { out.push(ord(c)) } return out }
+
+fn _read_u16le(bytes_, i) { return bytes_[i] + bytes_[i + 1] * 256 }
+fn _read_u32le(bytes_, i) {
+  return bytes_[i] + bytes_[i + 1] * 256 + bytes_[i + 2] * 65536 + bytes_[i + 3] * 16777216
+}
+fn _read_str(bytes_, i, n) {
+  let s = ""
+  let k = 0
+  while k < n { s = s + chr(bytes_[i + k]); k = k + 1 }
+  return s
+}
+
+# samples: floats in [-1, 1] (clamped). channels: 1 (mono) or 2 (stereo,
+# pre-interleaved by the caller). Always 16-bit PCM.
+fn write(path, samples, sample_rate, channels=1) {
+  let pcm = []
+  for s in samples {
+    let v = s
+    if v > 1.0 { v = 1.0 }
+    if v < -1.0 { v = -1.0 }
+    let n = int(v * 32767)
+    if n < 0 { n = 65536 + n }
+    let b = _u16le(n)
+    pcm.push(b[0]); pcm.push(b[1])
+  }
+
+  let byte_rate = sample_rate * channels * 2
+  let block_align = channels * 2
+  let data_size = len(pcm)
+
+  let header = _str_bytes("RIFF")
+  header = header + _u32le(36 + data_size)
+  header = header + _str_bytes("WAVE")
+  header = header + _str_bytes("fmt ")
+  header = header + _u32le(16)
+  header = header + _u16le(1)              # PCM
+  header = header + _u16le(channels)
+  header = header + _u32le(sample_rate)
+  header = header + _u32le(byte_rate)
+  header = header + _u16le(block_align)
+  header = header + _u16le(16)             # bits per sample
+  header = header + _str_bytes("data")
+  header = header + _u32le(data_size)
+
+  write_file(path, header + pcm)
+  return len(header) + len(pcm)
+}
+
+# Scans real RIFF chunks (doesn't assume a fixed header layout - files
+# from real recorders can have extra chunks like LIST before `data`).
+fn read(path) {
+  let b = read_file_bytes(path)
+  if len(b) < 12 or _read_str(b, 0, 4) != "RIFF" or _read_str(b, 8, 4) != "WAVE" {
+    throw {"type": "LarzValueError", "message": path + " is not a valid RIFF/WAVE file"}
+  }
+  let sample_rate = 0
+  let channels = 1
+  let bits_per_sample = 16
+  let data_start = -1
+  let data_size = 0
+
+  let pos = 12
+  while pos + 8 <= len(b) {
+    let chunk_id = _read_str(b, pos, 4)
+    let chunk_size = _read_u32le(b, pos + 4)
+    let body = pos + 8
+    if chunk_id == "fmt " {
+      channels = _read_u16le(b, body + 2)
+      sample_rate = _read_u32le(b, body + 4)
+      bits_per_sample = _read_u16le(b, body + 14)
+    } else if chunk_id == "data" {
+      data_start = body
+      data_size = chunk_size
+    }
+    pos = body + chunk_size + (chunk_size % 2)   # chunks are word-aligned
+  }
+
+  if data_start < 0 { throw {"type": "LarzValueError", "message": path + " has no data chunk"} }
+  if bits_per_sample != 16 {
+    throw {"type": "LarzValueError", "message": "wav.read() only supports 16-bit PCM, got " + str(bits_per_sample) + "-bit"}
+  }
+
+  let samples = []
+  let i = data_start
+  let end = data_start + data_size
+  while i + 1 < end {
+    let n = _read_u16le(b, i)
+    if n >= 32768 { n = n - 65536 }
+    samples.push(n / 32768.0)
+    i = i + 2
+  }
+
+  return {"sample_rate": sample_rate, "channels": channels, "samples": samples}
+}

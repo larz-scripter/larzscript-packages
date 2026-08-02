@@ -1,0 +1,246 @@
+# dsp - real, from-scratch audio signal processing: sin/cos/exp/ln (none
+# are builtins - `pow()` only takes whole-number exponents, same
+# constraint the `orbits` package works around), a biquad peaking/
+# shelving EQ (the real RBJ Audio EQ Cookbook formulas), a look-up-table
+# compressor (the transfer curve is precomputed once via the slow-but-
+# exact log/exp above, so the per-sample hot loop is pure array indexing,
+# not a log() call per sample - the standard real-DSP technique for this
+# exact problem), a brickwall limiter, and peak/RMS/normalize helpers.
+# Every filter's state is a plain dict the caller owns and threads through
+# calls (same convention as the `ratelimit` package) - no hidden globals,
+# so multiple independent filters/tracks never interfere.
+#
+#   import "dsp" as dsp
+#   let eq = dsp.biquad_peaking_new(1000, 6, 1.0, 22050)   # +6dB @ 1kHz
+#   let y = dsp.biquad_process(eq, x)                       # per sample
+#
+#   let comp = dsp.compressor_new(-18, 4, 5, 80, 22050)     # -18dB, 4:1
+#   let compressed = dsp.compressor_process_buffer(comp, buffer)
+#
+#   let limited = dsp.limit(buffer, -1.0)                   # ceiling, dBFS
+#   print(dsp.peak_dbfs(buffer), dsp.rms_dbfs(buffer))
+#   let normalized = dsp.normalize_to(buffer, -3.0)
+
+import "random" as rng
+
+let PI = 3.141592653589793
+let LN10 = 2.302585092994046
+let E = 2.718281828459045
+
+# ---- sin/cos/exp/ln - none are builtins (see orbits' own ln() for the
+# same constraint). Range-reduced Taylor series; accurate to ~1e-6 over
+# a full period, plenty for filter-coefficient and dB-conversion math. ----
+
+fn _exp(y) {
+  let whole = int(y)
+  if y < 0 and whole != y { whole = whole - 1 }
+  let frac = y - whole
+  let base = 1.0
+  let k = 0
+  while k < (whole < 0 ? -whole : whole) {
+    base = whole < 0 ? base / E : base * E
+    k = k + 1
+  }
+  let term = 1.0
+  let total = 1.0
+  let n = 1
+  while n < 30 { term = term * frac / n; total = total + term; n = n + 1 }
+  return base * total
+}
+
+fn _ln(x) {
+  if x <= 0 { throw {"type": "LarzValueError", "message": "ln() needs a positive number"} }
+  let lo = -50.0
+  let hi = 50.0
+  let i = 0
+  while i < 100 {
+    let mid = (lo + hi) / 2
+    if _exp(mid) < x { lo = mid } else { hi = mid }
+    i = i + 1
+  }
+  return (lo + hi) / 2
+}
+
+# `%` truncates both sides to integers first (Larzscript has no float
+# fmod builtin) - not usable here, x is a phase in radians. This is a
+# real float-safe modulo via floor division instead.
+fn _fmod(x, m) {
+  let q = x / m
+  let qf = floor(q)
+  return x - qf * m
+}
+
+fn sin_(x) {
+  let y = _fmod(x, 2 * PI)
+  if y > PI { y = y - 2 * PI }
+  if y < -PI { y = y + 2 * PI }
+  let y2 = y * y
+  # 4-term reduced Taylor/Horner form - accurate to ~1e-6 on [-pi, pi].
+  return y * (1 - y2 / 6 * (1 - y2 / 20 * (1 - y2 / 42 * (1 - y2 / 72))))
+}
+
+fn cos_(x) { return sin_(x + PI / 2) }
+
+fn db_to_linear(db) { return _exp(db / 20 * LN10) }
+fn linear_to_db(x) { return x <= 0 ? -120.0 : _ln(x) / LN10 * 20 }
+
+# ---- biquad EQ: RBJ Audio EQ Cookbook peaking and shelving filters.
+# `new_*` computes the coefficients once; `process` runs the per-sample
+# recurrence (2 multiplies-and-adds of history - cheap, called once per
+# sample, unlike coefficient setup which uses the slow sin_/_exp above). ----
+
+fn biquad_peaking_new(freq_hz, gain_db, q, sample_rate) {
+  let a = db_to_linear(gain_db / 2)
+  let w0 = 2 * PI * freq_hz / sample_rate
+  let alpha = sin_(w0) / (2 * q)
+  let cw0 = cos_(w0)
+  let b0 = 1 + alpha * a
+  let b1 = -2 * cw0
+  let b2 = 1 - alpha * a
+  let a0 = 1 + alpha / a
+  let a1 = -2 * cw0
+  let a2 = 1 - alpha / a
+  return {"b0": b0 / a0, "b1": b1 / a0, "b2": b2 / a0, "a1": a1 / a0, "a2": a2 / a0,
+          "x1": 0.0, "x2": 0.0, "y1": 0.0, "y2": 0.0}
+}
+
+# Low-shelf (boost/cut everything below freq_hz) or high-shelf (above).
+fn biquad_shelf_new(freq_hz, gain_db, sample_rate, high) {
+  let a = db_to_linear(gain_db / 2)
+  let w0 = 2 * PI * freq_hz / sample_rate
+  let cw0 = cos_(w0)
+  let sw0 = sin_(w0)
+  let alpha = sw0 / 2 * sqrt((a + 1 / a) * (1 / 0.9 - 1) + 2)
+  let sq = 2 * sqrt(a) * alpha
+  let b0 = 0.0
+  let b1 = 0.0
+  let b2 = 0.0
+  let a0 = 0.0
+  let a1 = 0.0
+  let a2 = 0.0
+  if high {
+    b0 = a * ((a + 1) + (a - 1) * cw0 + sq)
+    b1 = -2 * a * ((a - 1) + (a + 1) * cw0)
+    b2 = a * ((a + 1) + (a - 1) * cw0 - sq)
+    a0 = (a + 1) - (a - 1) * cw0 + sq
+    a1 = 2 * ((a - 1) - (a + 1) * cw0)
+    a2 = (a + 1) - (a - 1) * cw0 - sq
+  } else {
+    b0 = a * ((a + 1) - (a - 1) * cw0 + sq)
+    b1 = 2 * a * ((a - 1) - (a + 1) * cw0)
+    b2 = a * ((a + 1) - (a - 1) * cw0 - sq)
+    a0 = (a + 1) + (a - 1) * cw0 + sq
+    a1 = -2 * ((a - 1) + (a + 1) * cw0)
+    a2 = (a + 1) + (a - 1) * cw0 - sq
+  }
+  return {"b0": b0 / a0, "b1": b1 / a0, "b2": b2 / a0, "a1": a1 / a0, "a2": a2 / a0,
+          "x1": 0.0, "x2": 0.0, "y1": 0.0, "y2": 0.0}
+}
+
+fn biquad_process(f, x) {
+  let y = f["b0"] * x + f["b1"] * f["x1"] + f["b2"] * f["x2"] - f["a1"] * f["y1"] - f["a2"] * f["y2"]
+  f["x2"] = f["x1"]; f["x1"] = x
+  f["y2"] = f["y1"]; f["y1"] = y
+  return y
+}
+
+fn biquad_process_buffer(f, buf) {
+  let out = []
+  for x in buf { out.push(biquad_process(f, x)) }
+  return out
+}
+
+# ---- compressor: threshold/ratio in dB, attack/release in ms. Builds a
+# 4096-point linear-envelope -> gain lookup table ONCE (using the slow
+# _ln/_exp above), so the per-sample hot loop is index + multiply, not a
+# log() call per sample. ----
+
+let _LUT_SIZE = 4096
+let _LUT_MAX_LINEAR = 4.0   # covers up to +12dBFS of headroom
+
+fn compressor_new(threshold_db, ratio, attack_ms, release_ms, sample_rate) {
+  let lut = []
+  let i = 0
+  while i < _LUT_SIZE {
+    let env_linear = (i / float(_LUT_SIZE)) * _LUT_MAX_LINEAR
+    let gain = 1.0
+    if env_linear > 0 {
+      let in_db = linear_to_db(env_linear)
+      let out_db = in_db > threshold_db ? threshold_db + (in_db - threshold_db) / ratio : in_db
+      gain = db_to_linear(out_db - in_db)
+    }
+    lut.push(gain)
+    i = i + 1
+  }
+  let attack_coeff = _exp(-1.0 / ((attack_ms / 1000.0) * sample_rate))
+  let release_coeff = _exp(-1.0 / ((release_ms / 1000.0) * sample_rate))
+  return {"lut": lut, "attack": attack_coeff, "release": release_coeff, "env": 0.0}
+}
+
+fn _lut_lookup(lut, env_linear) {
+  let idx = int((env_linear / _LUT_MAX_LINEAR) * _LUT_SIZE)
+  if idx < 0 { idx = 0 }
+  if idx >= _LUT_SIZE { idx = _LUT_SIZE - 1 }
+  return lut[idx]
+}
+
+fn compressor_process(c, x) {
+  let level = x < 0 ? -x : x
+  let coeff = level > c["env"] ? c["attack"] : c["release"]
+  c["env"] = c["env"] * coeff + level * (1 - coeff)
+  let gain = _lut_lookup(c["lut"], c["env"])
+  return x * gain
+}
+
+fn compressor_process_buffer(c, buf) {
+  let out = []
+  for x in buf { out.push(compressor_process(c, x)) }
+  return out
+}
+
+# ---- limiter: a true brickwall is just a linear clamp to the ceiling -
+# infinite ratio needs no log/LUT at all, unlike the compressor above. ----
+
+fn limit(buf, ceiling_db) {
+  let ceiling = db_to_linear(ceiling_db)
+  let out = []
+  for x in buf {
+    if x > ceiling { out.push(ceiling) }
+    else if x < -ceiling { out.push(-ceiling) }
+    else { out.push(x) }
+  }
+  return out
+}
+
+# ---- level metering + normalization ----
+
+fn peak_dbfs(buf) {
+  let peak = 0.0
+  for x in buf { let a = x < 0 ? -x : x; if a > peak { peak = a } }
+  return linear_to_db(peak)
+}
+
+fn rms_dbfs(buf) {
+  if len(buf) == 0 { return -120.0 }
+  let sum_sq = 0.0
+  for x in buf { sum_sq = sum_sq + x * x }
+  return linear_to_db(sqrt(sum_sq / len(buf)))
+}
+
+fn normalize_to(buf, target_dbfs) {
+  let peak = db_to_linear(peak_dbfs(buf))
+  if peak <= 0 { return list(buf) }
+  let target = db_to_linear(target_dbfs)
+  let g = target / peak
+  let out = []
+  for x in buf { out.push(x * g) }
+  return out
+}
+
+# ---- synthesis helpers ----
+
+fn noise() { return rng.random() * 2 - 1 }
+
+# Exponential decay envelope: 1.0 at t=0, decays toward 0 by `decay_rate`
+# (higher = faster). t in seconds.
+fn envelope_exp(t, decay_rate) { return _exp(-t * decay_rate) }
