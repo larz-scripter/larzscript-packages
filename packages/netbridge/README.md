@@ -63,6 +63,22 @@ relay:2200  ->  127.0.0.1:22
 (from the relay: `ssh -p 2200 you@127.0.0.1` now lands on the client
 machine's real `sshd`.)
 
+### On Windows
+
+[`examples/password_setup_windows.lz`](examples/password_setup_windows.lz) -
+same script, same 4 fields, but targets Windows' own built-in OpenSSH
+Server instead of a Linux `sshd`. Installs/starts the Windows OpenSSH
+Server feature if it isn't already running (needs one Administrator run
+for that), then generates a key and connects exactly like the Linux
+version. For the one-time password step it borrows WSL's `sshpass` if
+WSL is installed on the machine (same trusted setup script, just reached
+through WSL as a transport - `sshd` and the tunnel itself stay 100%
+native Windows); without WSL it prints the setup script for you to run
+by hand, once. Point of a native-Windows target at all: WSL's `sshd`
+sits behind its own virtual network adapter, which is the actual cause
+if a tunnel connects but times out on the far side - native Windows
+doesn't have that problem.
+
 ## Setting up a real relay by hand, with your own SSH key
 
 If you'd rather not put a root password in a script - the same setup,
