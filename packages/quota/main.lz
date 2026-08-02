@@ -1,0 +1,70 @@
+# quota - a shared, sliding-window quota ledger that MULTIPLE INDEPENDENT
+# PROCESSES draw from together, for the case ratelimit/limit don't cover:
+# one external ceiling (a mailbox's ~200/hr abuse limit, a paid API's
+# per-minute cap) that several unrelated apps/crons all send against, with
+# no fair static per-app split - a quiet app should free budget for a busy
+# one. Ported from a real production guard (a shared Titan mailbox's
+# hourly limit, several estate apps all sending as it).
+#
+# Atomicity across concurrent processes comes from a real `flock`-wrapped
+# check-and-append (an awk one-liner counts the trailing window, then
+# appends, all inside the lock) - a plain read-then-write from Larzscript
+# would have a race window between the count and the append; flock closes
+# it the same way a database transaction would, without needing one.
+#
+# FAIL-OPEN: if flock/awk are missing or the ledger is unwritable,
+# check_and_record() returns true - a guard must never itself become the
+# reason legitimate calls stop.
+#
+#   import "quota" as quota
+#   let caps = {"transactional": 150, "marketing": 90}
+#   if quota.check_and_record("/var/lib/app/mail.ledger", "transactional", caps, 150) {
+#     send_the_email()
+#   } else {
+#     defer_it()
+#   }
+#   print(quota.count("/var/lib/app/mail.ledger", "transactional", 3600), "sent in the last hour")
+
+fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
+
+# How many `kind` entries were recorded in the trailing `window_seconds`.
+# Read-only - does not record anything, does not need the lock (a stale-
+# by-a-few-ms count is fine for introspection).
+fn count(ledger_path, kind, window_seconds=3600) {
+  if not file_exists(ledger_path) { return 0 }
+  let cutoff = int(time()) - window_seconds
+  let n = 0
+  for line in read_file(ledger_path).split("\n") {
+    if line.strip() == "" { continue }
+    let parts = line.split(" ")
+    if len(parts) < 2 { continue }
+    if int(parts[0]) > cutoff and parts[1] == kind { n = n + 1 }
+  }
+  return n
+}
+
+# True if a call of `kind` is allowed right now (and records it); false if
+# the trailing-`window_seconds` count for `kind` has reached its cap.
+# `caps` maps kind -> limit; a kind not in `caps` uses `default_cap`.
+# Fail-open on any error (missing flock/awk, unwritable ledger, ...).
+fn check_and_record(ledger_path, kind, caps, default_cap, window_seconds=3600) {
+  let cap = caps.has(kind) ? caps[kind] : default_cap
+  let cutoff = int(time()) - window_seconds
+
+  let script = "touch " + _q(ledger_path) + "; n=$(awk -v cutoff=" + str(cutoff) + " -v kind=" + _q(kind) +
+    " '$1>cutoff && $2==kind {c++} END{print c+0}' " + _q(ledger_path) + " 2>/dev/null); n=${n:-0}; " +
+    "if [ \"$n\" -lt " + str(cap) + " ]; then echo \"$(date +%s) " + kind + "\" >> " + _q(ledger_path) + "; echo ALLOW; else echo DENY; fi"
+
+  let out = capture("flock " + _q(ledger_path + ".lock") + " -c " + _q(script) + " 2>/dev/null").strip()
+  if out == "ALLOW" { return true }
+  if out == "DENY" { return false }
+  return true
+}
+
+# Cap minus the current trailing-window count for `kind` (never negative).
+# Read-only, same staleness caveat as count().
+fn remaining(ledger_path, kind, caps, default_cap, window_seconds=3600) {
+  let cap = caps.has(kind) ? caps[kind] : default_cap
+  let used = count(ledger_path, kind, window_seconds)
+  return used >= cap ? 0 : cap - used
+}

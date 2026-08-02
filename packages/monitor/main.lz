@@ -1,0 +1,53 @@
+# monitor - debounced ok/fail state-transition tracking for a health
+# check you run on a schedule (a cron, a loop). Ported from a real
+# production gateway monitor: persist "are we currently failing, and
+# for how many checks in a row", so you alert on the FIRST failure,
+# then every Nth repeat (not every single failed check - a check that
+# runs hourly and stays down for a day would otherwise send 24 emails
+# for one incident), and exactly once on recovery. Pairs directly with
+# statuscard (format the alert) and smtp (send it) - or your own mailer.
+#
+#   import "monitor" as monitor
+#   let ok = real_health_check()
+#   let r = monitor.check("/var/lib/app/.health_state.json", ok, 4)
+#   if r["should_alert"] {
+#     if r["recovered"] { send_recovery_email() }
+#     else { send_alert_email("failure #" + str(r["fails"])) }
+#   }
+
+import "json" as json
+
+fn _default_state() { return {"status": "ok", "fails": 0} }
+
+fn _load(state_path) {
+  if not file_exists(state_path) { return _default_state() }
+  let txt = read_file(state_path).strip()
+  if txt == "" { return _default_state() }
+  return json.parse(txt)
+}
+
+fn _save(state_path, st) { write_file(state_path, json.stringify(st)) }
+
+# Reads the persisted state without recording anything.
+fn state(state_path) { return _load(state_path) }
+
+# Clears persisted state back to "ok, 0 fails" (e.g. after a manual fix).
+fn reset(state_path) { _save(state_path, _default_state()); return true }
+
+# Records one check result and returns
+# {"status": "ok"|"fail", "fails": N, "should_alert": bool, "recovered": bool}.
+# should_alert is true on the first failure, every `every_n`th failure
+# after that, and exactly once when a failing run turns back to ok.
+fn check(state_path, ok, every_n=4) {
+  let st = _load(state_path)
+  if not ok {
+    let fails = (st.has("fails") ? st["fails"] : 0) + 1
+    let should_alert = fails == 1 or fails % every_n == 0
+    _save(state_path, {"status": "fail", "fails": fails})
+    return {"status": "fail", "fails": fails, "should_alert": should_alert, "recovered": false}
+  } else {
+    let was_failing = (st.has("status") ? st["status"] : "ok") == "fail"
+    _save(state_path, {"status": "ok", "fails": 0})
+    return {"status": "ok", "fails": 0, "should_alert": was_failing, "recovered": was_failing}
+  }
+}

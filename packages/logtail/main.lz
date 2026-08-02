@@ -1,0 +1,72 @@
+# logtail - reads only the bytes appended to a growing log file since
+# the last call, via a persisted byte offset - so an hourly error-scan
+# cron doesn't re-read and re-filter the whole log every run. Ported
+# from a real production error watcher. If the file is smaller than
+# the saved offset (rotated/truncated), it transparently starts over
+# from the top instead of erroring.
+#
+# Uses `tail -c +N` to read from a byte offset - Larzscript has no
+# low-level file-seek builtin, and this is the same "shell out to a
+# real tool" pattern curl/sha256sum/flock use elsewhere in the stack.
+#
+#   import "logtail" as logtail
+#   let new_lines = logtail.grep_new("/var/lib/app/.watch_state", "/var/log/app.log",
+#     ["Traceback", "ERROR", "CRITICAL", "Fatal error"])
+#   if len(new_lines) > 0 { alert(new_lines) }
+
+fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
+
+fn _file_size(path) {
+  let out = capture("stat -c%s " + _q(path) + " 2>/dev/null").strip()
+  return out == "" ? 0 : int(out)
+}
+
+fn _load_offset(state_path) {
+  if not file_exists(state_path) { return 0 }
+  let txt = read_file(state_path).strip()
+  return txt == "" ? 0 : int(txt)
+}
+
+fn _save_offset(state_path, n) { write_file(state_path, str(n)) }
+
+# The saved byte offset for `state_path` (0 if never read before).
+fn offset(state_path) { return _load_offset(state_path) }
+
+# Forgets the saved offset, so the next read starts from the top again.
+fn reset(state_path) { _save_offset(state_path, 0); return true }
+
+# Everything appended to `log_path` since the last read_new() call for
+# this `state_path` (empty string if nothing new, or if the file
+# doesn't exist yet). Persists the new offset as a side effect.
+fn read_new(state_path, log_path) {
+  if not file_exists(log_path) { return "" }
+  let size = _file_size(log_path)
+  let off = _load_offset(state_path)
+  if size < off { off = 0 }
+  if off >= size { _save_offset(state_path, size); return "" }
+  let new_text = capture("tail -c +" + str(off + 1) + " " + _q(log_path))
+  _save_offset(state_path, size)
+  return new_text
+}
+
+# Same as read_new(), split into non-empty lines.
+fn read_new_lines(state_path, log_path) {
+  let lines = []
+  for line in read_new(state_path, log_path).split("\n") {
+    if line.strip() != "" { lines.push(line) }
+  }
+  return lines
+}
+
+# New lines that contain ANY of `patterns` as a substring (case-
+# sensitive, matching the real watcher's plain "in" check - not regex,
+# so it's exact and predictable for log-line matching).
+fn grep_new(state_path, log_path, patterns) {
+  let matches = []
+  for line in read_new_lines(state_path, log_path) {
+    for p in patterns {
+      if line.find(p) != -1 { matches.push(line); break }
+    }
+  }
+  return matches
+}

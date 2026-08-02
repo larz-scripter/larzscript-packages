@@ -1,0 +1,70 @@
+# sitemap - build and incrementally update a sitemap.xml, the way a
+# real site actually grows one: parse what's already listed, add only
+# the genuinely new URLs, leave everything else untouched. Ported from
+# a real production job that adds newly-published pages to a live
+# sitemap.xml without disturbing the rest of it. Pairs with indexnow -
+# add a URL to the sitemap, then indexnow.submit_urls() it.
+#
+#   import "sitemap" as sitemap
+#   let xml = read_file("sitemap.xml")
+#   let result = sitemap.add_urls(xml, ["https://example.com/new-page/"], {"changefreq": "monthly", "priority": "0.7"})
+#   print(result["added"], "new URL(s) added")
+#   write_file("sitemap.xml", result["xml"])
+#
+#   let fresh = sitemap.build(["https://example.com/"], {"changefreq": "weekly", "priority": "1.0"})
+
+import "xml" as xml
+
+fn _default(opts, key, fallback) { return opts.has(key) ? opts[key] : fallback }
+
+# Every URL currently listed in a sitemap.xml's <loc> tags.
+fn urls(xml_text) {
+  let found = []
+  let rest = xml_text
+  let tag_open = "<loc>"
+  let tag_close = "</loc>"
+  let i = rest.find(tag_open)
+  while i != -1 {
+    let after = rest[i + len(tag_open):len(rest)]
+    let j = after.find(tag_close)
+    if j == -1 { break }
+    found.push(after[0:j])
+    rest = after[j + len(tag_close):len(after)]
+    i = rest.find(tag_open)
+  }
+  return found
+}
+
+fn _entry(url, opts) {
+  let changefreq = _default(opts, "changefreq", "")
+  let priority = _default(opts, "priority", "")
+  let lastmod = _default(opts, "lastmod", "")
+  let out = "  <url><loc>" + xml.escape_text(url) + "</loc>"
+  if lastmod != "" { out = out + "<lastmod>" + lastmod + "</lastmod>" }
+  if changefreq != "" { out = out + "<changefreq>" + changefreq + "</changefreq>" }
+  if priority != "" { out = out + "<priority>" + priority + "</priority>" }
+  return out + "</url>\n"
+}
+
+# Adds only the URLs in `new_urls` that aren't already present, right
+# before </urlset>. Returns {"xml": updated_text, "added": [...]} -
+# `added` is empty (and xml is returned unchanged) if there was nothing
+# new. `opts`: changefreq / priority / lastmod, all optional.
+fn add_urls(xml_text, new_urls, opts={}) {
+  let existing = {}
+  for u in urls(xml_text) { existing[u] = true }
+  let added = []
+  for u in new_urls { if not existing.has(u) { added.push(u); existing[u] = true } }
+  if len(added) == 0 { return {"xml": xml_text, "added": []} }
+  let block = ""
+  for u in added { block = block + _entry(u, opts) }
+  return {"xml": xml_text.replace("</urlset>", block + "</urlset>"), "added": added}
+}
+
+# Builds a complete, standalone sitemap.xml from a list of URLs.
+fn build(urls_list, opts={}) {
+  let out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+    "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+  for u in urls_list { out = out + _entry(u, opts) }
+  return out + "</urlset>\n"
+}

@@ -1,0 +1,101 @@
+# imap - read/search/fetch email over IMAP, via curl (curl has real,
+# mature IMAP/IMAPS support, the same "shell out to a real tool" pattern
+# http and smtp use). The read-side counterpart to smtp (send) and
+# email (build/parse): fetch() returns the same raw RFC822 text
+# email.parse() already knows how to read, so the two compose with no
+# glue code.
+#
+#   import "imap" as imap
+#   let cfg = {"host": "imap.example.com", "port": 993, "user": "a@example.com", "password": "secret"}
+#   print(imap.status(cfg, "INBOX"))                # {"MESSAGES": 13, "UNSEEN": 0}
+#   let ids = imap.search(cfg, "INBOX", "UNSEEN")    # [4, 7, 12]
+#   let raw = imap.fetch(cfg, "INBOX", ids[0])       # full RFC822 text
+#   import "email" as email
+#   let msg = email.parse(raw)                       # {"from", "subject", "text", ...}
+
+fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
+
+fn _last_index_of(s, ch) {
+  let i = len(s) - 1
+  while i >= 0 {
+    if s[i:i + 1] == ch { return i }
+    i = i - 1
+  }
+  return -1
+}
+
+fn _default(cfg, key, fallback) { return cfg.has(key) ? cfg[key] : fallback }
+
+fn _base_url(cfg, mailbox) {
+  let scheme = _default(cfg, "tls", true) ? "imaps" : "imap"
+  let port = _default(cfg, "port", 993)
+  return scheme + "://" + cfg["host"] + ":" + str(port) + "/" + mailbox
+}
+
+fn _auth_flags(cfg) { return " --user " + _q(cfg["user"] + ":" + cfg["password"]) }
+
+fn _run_command(cfg, mailbox, command) {
+  return capture("curl -fsS --url " + _q(_base_url(cfg, mailbox)) + _auth_flags(cfg) +
+    " -X " + _q(command) + " 2>/dev/null")
+}
+
+# {"MESSAGES": N, "UNSEEN": N, ...} - whatever fields you ask for, e.g.
+# status(cfg, "INBOX", "MESSAGES UNSEEN RECENT").
+fn status(cfg, mailbox, fields="MESSAGES UNSEEN") {
+  let out = _run_command(cfg, mailbox, "STATUS " + mailbox + " (" + fields + ")").strip()
+  let result = {}
+  let open_paren = out.find("(")
+  if open_paren == -1 { return result }
+  let inner = out[open_paren + 1:len(out) - 1]
+  let parts = inner.split(" ")
+  let i = 0
+  while i + 1 < len(parts) {
+    result[parts[i]] = int(parts[i + 1])
+    i = i + 2
+  }
+  return result
+}
+
+# UIDs matching an IMAP SEARCH criteria string - "ALL", "UNSEEN", "FROM
+# someone@example.com", etc. Uses UID SEARCH (not plain SEARCH), so
+# every id returned here is safe to hand straight to fetch().
+fn search(cfg, mailbox, criteria="ALL") {
+  let out = _run_command(cfg, mailbox, "UID SEARCH " + criteria).strip()
+  let prefix = "* SEARCH"
+  if out.find(prefix) != 0 { return [] }
+  let rest = out[len(prefix):len(out)].strip()
+  if rest == "" { return [] }
+  let ids = []
+  for tok in rest.split(" ") { if tok.strip() != "" { ids.push(int(tok)) } }
+  return ids
+}
+
+# The full raw RFC822 text of one message, by UID (curl's IMAP URLs
+# only support a real, documented ;UID= selector - there is no
+# sequence-number equivalent, and UIDs are the right thing to hold onto
+# anyway since sequence numbers shift as messages are deleted).
+fn fetch(cfg, mailbox, uid) {
+  return capture("curl -fsS --url " + _q(_base_url(cfg, mailbox) + ";UID=" + str(uid)) +
+    _auth_flags(cfg) + " 2>/dev/null")
+}
+
+# Every mailbox name on the account (INBOX, Spam, Trash, any custom
+# folders) - parsed from the IMAP LIST response. Handles both quoted
+# names ("My Folder") and bare ones (INBOX).
+fn list_mailboxes(cfg) {
+  let out = capture("curl -fsS --url " + _q(_base_url(cfg, "")) + _auth_flags(cfg) + " 2>/dev/null")
+  let names = []
+  for line in out.split("\n") {
+    if line.find("* LIST") != 0 { continue }
+    let trimmed = line.strip()
+    if len(trimmed) == 0 { continue }
+    if trimmed[len(trimmed) - 1:len(trimmed)] == "\"" {
+      let start = _last_index_of(trimmed[0:len(trimmed) - 1], "\"")
+      names.push(trimmed[start + 1:len(trimmed) - 1])
+    } else {
+      let parts = trimmed.split(" ")
+      names.push(parts[len(parts) - 1])
+    }
+  }
+  return names
+}
