@@ -1,0 +1,61 @@
+# neows - a real client for NASA's Near-Earth-Object Web Service (NeoWs),
+# built on the http package. feed() returns every asteroid NASA's own
+# database has tracked making a close approach to Earth in a date range -
+# real diameter/velocity/miss-distance figures pulled live from
+# api.nasa.gov, not a fixture. Works out of the box against NASA's public
+# DEMO_KEY (rate-limited but real, no signup needed); pass your own key
+# from https://api.nasa.gov for production use.
+#
+#   import "neows" as neows
+#   import "time" as time
+#   let objects = neows.feed(time.today(), time.today())
+#   for o in objects {
+#     print(o["name"] + ": " + str(o["velocity_km_s"]) + " km/s, " +
+#           str(o["miss_distance_km"]) + " km miss distance")
+#   }
+#   print(neows.lookup("3542519")["name"])   # a single object by NASA id
+
+import "http" as http
+
+let BASE_URL = "https://api.nasa.gov/neo/rest/v1"
+
+# NASA's JSON has velocity/miss-distance as strings (it keeps several unit
+# conversions side by side under one key each) - real() converts the one
+# this package standardizes on (km/s, km) to a real number.
+fn _num(s) { return float(s) }
+
+fn _record(o) {
+  let d = o["estimated_diameter"]["kilometers"]
+  let approach = o["close_approach_data"][0]
+  return {
+    "id": o["id"],
+    "name": o["name"],
+    "diameter_km_min": d["estimated_diameter_min"],
+    "diameter_km_max": d["estimated_diameter_max"],
+    "velocity_km_s": _num(approach["relative_velocity"]["kilometers_per_second"]),
+    "miss_distance_km": _num(approach["miss_distance"]["kilometers"]),
+    "close_approach_date": approach["close_approach_date"],
+    "hazardous": o["is_potentially_hazardous_asteroid"],
+    "jpl_url": o["nasa_jpl_url"],
+  }
+}
+
+# Every tracked object with a close approach between start_date and
+# end_date (inclusive, "YYYY-MM-DD", NASA caps the range at 7 days).
+fn feed(start_date, end_date, api_key="DEMO_KEY") {
+  let url = BASE_URL + "/feed?start_date=" + start_date + "&end_date=" + end_date + "&api_key=" + api_key
+  let data = http.get_json(url)
+  let objects = []
+  for day in sorted(keys(data["near_earth_objects"])) {
+    for o in data["near_earth_objects"][day] {
+      objects.push(_record(o))
+    }
+  }
+  return objects
+}
+
+# A single object by its NASA id (the "id" field feed() returns).
+fn lookup(id, api_key="DEMO_KEY") {
+  let url = BASE_URL + "/neo/" + str(id) + "?api_key=" + api_key
+  return _record(http.get_json(url))
+}

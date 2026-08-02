@@ -187,6 +187,8 @@ Larzscript, one per Larz Stack library slot (`larzcart` -> `cart`, etc.):
 | [anomaly](packages/anomaly) | find cohorts whose event rate is implausible for their volume |
 | [accesslog](packages/accesslog) | parse Apache/Nginx combined access logs, find your backlinks for free |
 | [dispatch](packages/dispatch) | a multi-tenant outbound webhook registry, N destinations, one backend |
+| [orbits](packages/orbits) | real two-body orbital mechanics + the Tsiolkovsky rocket equation |
+| [neows](packages/neows) | a real client for NASA's live Near-Earth-Object tracking feed |
 
 ## Adding a package
 
