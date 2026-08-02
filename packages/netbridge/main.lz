@@ -1,0 +1,199 @@
+# netbridge - reverse SSH tunnels: expose a service on THIS machine
+# (behind NAT/CGNAT/a firewall) through a relay server you control,
+# without opening any inbound port here. Two tunnel kinds, both built
+# on plain `ssh -R` (no VPN, no extra daemon on the relay beyond sshd):
+#
+#   "forward" - classic reverse port-forward. relay:REMOTE_PORT becomes
+#               a door straight to LOCAL_HOST:LOCAL_PORT on this
+#               machine (e.g. exposing this box's own sshd, so an
+#               operator on the relay can `ssh -p REMOTE_PORT you@127.0.0.1`
+#               and land on a real shell here - the pattern this
+#               package is modeled on).
+#   "socks"   - reverse DYNAMIC forward (no destination). The relay
+#               gets a SOCKS5 listener; THIS machine's ssh client
+#               resolves each connection using its own routing table -
+#               one tunnel reaches your whole reachable network, not
+#               just one port.
+#
+# Ported from the design behind the real NetBridge Windows app (same
+# `-N -T -R ... -o ExitOnForwardFailure=yes` command shape, same
+# UP-detection-by-grace-period + known-error-marker scan, same
+# exponential-backoff reconnect). Larzscript has no OS threads, so
+# there's no internal supervisor thread the way the original has one
+# per tunnel - `supervise()` here blocks the calling process for as
+# long as the tunnel should stay up (run one `larzscript` process per
+# tunnel, backgrounded by your OS the same way the original backgrounds
+# one `ssh` child process per tunnel anyway). Needs a real `ssh` binary
+# on PATH - hosted-only, shells out, hasn't been tried against the
+# kernel's freestanding net stack.
+#
+#   import "netbridge" as netbridge
+#   let srv = netbridge.default_server()
+#   srv["host"] = "relay.example.com"
+#   srv["identity"] = "~/.ssh/netbridge_key"
+#   let t = netbridge.tunnel_forward("my-shell", 2200, "127.0.0.1", 22)
+#   print(netbridge.build_ssh_command(srv, t))
+#   netbridge.supervise(srv, t, {"log_fn": fn(name, line) { print(line) }})
+
+import "json" as json
+
+fn default_server() {
+  return {
+    "host": "", "port": 22, "user": "tunnel", "identity": "netbridge_key",
+    "alive_interval": 15, "alive_count_max": 3,
+    "retry_min": 5, "retry_max": 45, "ssh_exe": "ssh", "known_hosts": "known_hosts"
+  }
+}
+
+fn new_config(server_overrides={}) {
+  let srv = default_server()
+  for k in keys(server_overrides) { srv[k] = server_overrides[k] }
+  return {"server": srv, "tunnels": []}
+}
+
+fn tunnel_socks(name, remote_bind_port, bind_address="", autostart=true) {
+  return {"name": name, "kind": "socks", "remote_bind_port": remote_bind_port, "bind_address": bind_address, "autostart": autostart}
+}
+
+fn tunnel_forward(name, remote_bind_port, local_host="localhost", local_port=22, bind_address="", autostart=true) {
+  return {"name": name, "kind": "forward", "remote_bind_port": remote_bind_port, "bind_address": bind_address, "local_host": local_host, "local_port": local_port, "autostart": autostart}
+}
+
+# The argument to ssh's -R for this tunnel.
+fn forward_spec(tunnel) {
+  let port = tunnel["remote_bind_port"]
+  let bind = tunnel.get("bind_address", "").strip()
+  if tunnel["kind"] == "socks" {
+    return len(bind) > 0 ? bind + ":" + str(port) : str(port)
+  }
+  let dest = tunnel.get("local_host", "localhost") + ":" + str(tunnel.get("local_port", 22))
+  return len(bind) > 0 ? bind + ":" + str(port) + ":" + dest : str(port) + ":" + dest
+}
+
+fn route_label(tunnel) {
+  if tunnel["kind"] == "socks" {
+    return "SOCKS5 @ relay:" + str(tunnel["remote_bind_port"]) + "  ->  (whole reachable network)"
+  }
+  return "relay:" + str(tunnel["remote_bind_port"]) + "  ->  " + tunnel.get("local_host", "localhost") + ":" + str(tunnel.get("local_port", "?"))
+}
+
+# ---- the reverse-shell convenience pair: derive a per-machine relay
+# port from the first socks tunnel so many machines behind the same
+# relay never collide (1080->2200, 1081->2201, ...). ----
+
+fn primary_socks_port(cfg) {
+  for t in cfg["tunnels"] { if t["kind"] == "socks" { return t["remote_bind_port"] } }
+  return 1080
+}
+
+fn effective_shell_port(cfg, explicit=0) {
+  if explicit > 0 { return explicit }
+  return 2200 + (primary_socks_port(cfg) - 1080)
+}
+
+# ---- command construction ----
+
+fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
+
+fn build_ssh_command(server, tunnel) {
+  let parts = [
+    _q(server["ssh_exe"]), "-N", "-T",
+    "-p", str(server["port"]),
+    "-i", _q(server["identity"]),
+    "-R", _q(forward_spec(tunnel)),
+    "-o", "BatchMode=yes",
+    "-o", "ExitOnForwardFailure=yes",
+    "-o", "ServerAliveInterval=" + str(server["alive_interval"]),
+    "-o", "ServerAliveCountMax=" + str(server["alive_count_max"]),
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "UserKnownHostsFile=" + _q(server["known_hosts"]),
+    _q(server["user"] + "@" + server["host"])
+  ]
+  return join(parts, " ")
+}
+
+# ---- config persistence ----
+
+fn config_load(path) {
+  if not file_exists(path) {
+    let cfg = new_config()
+    config_save(cfg, path)
+    return cfg
+  }
+  let cfg = json.parse(read_file(path))
+  let srv = default_server()
+  for k in keys(cfg["server"]) { srv[k] = cfg["server"][k] }
+  cfg["server"] = srv
+  if not cfg.has("tunnels") { cfg["tunnels"] = [] }
+  return cfg
+}
+
+fn config_save(cfg, path) {
+  let tmp = path + ".tmp"
+  write_file(tmp, json.stringify(cfg))
+  rename(tmp, path)
+}
+
+# ---- error detection (same marker set the real supervisor scans for -
+# ssh -N is silent on success, so failure is detected by what it prints,
+# not by waiting for a nonzero exit that may never come while it's up) ----
+
+let ERROR_MARKERS = [
+  "permission denied", "not accessible", "remote port forwarding failed",
+  "connection refused", "connection timed out", "host key verification failed",
+  "could not resolve", "no route to host"
+]
+
+fn is_error_line(line) {
+  let low = line.lower()
+  for marker in ERROR_MARKERS { if low.find(marker) >= 0 { return true } }
+  return false
+}
+
+# ---- running ----
+
+# One attempt: runs ssh to completion (or until it's killed elsewhere),
+# returns {"output", "had_error", "exit_code"}. Blocks for as long as
+# the tunnel stays up - that's real for a `-N` reverse tunnel, not a bug.
+fn run_once(server, tunnel) {
+  let cmd = build_ssh_command(server, tunnel) + " 2>&1"
+  let output = capture(cmd)
+  let had_error = false
+  for line in output.split("\n") { if is_error_line(line) { had_error = true } }
+  return {"output": output, "had_error": had_error}
+}
+
+# Runs run_once() in a retry loop with exponential backoff (retry_min
+# doubling up to retry_max on each failed attempt, reset after a run
+# that stayed up more than 60s) - same shape as the original supervisor,
+# minus the internal thread (there is none to have). `opts`:
+#   log_fn(name, line) - called once per real event (connecting/error/
+#     reconnecting), for hooking up your own logging/printing.
+#   sleep_fn(seconds) - injectable, so tests don't really wait.
+#   max_attempts - stop after N attempts instead of forever (tests).
+fn supervise(server, tunnel, opts={}) {
+  let log_fn = opts.has("log_fn") ? opts["log_fn"] : fn(name, line) {}
+  let sleep_fn = opts.has("sleep_fn") ? opts["sleep_fn"] : sleep
+  let max_attempts = opts.has("max_attempts") ? opts["max_attempts"] : nil
+  let backoff = server["retry_min"]
+  let attempts = 0
+  while max_attempts == nil or attempts < max_attempts {
+    attempts = attempts + 1
+    log_fn(tunnel["name"], "connecting: " + route_label(tunnel))
+    let started = clock()
+    let result = run_once(server, tunnel)
+    let ran_seconds = clock() - started
+    if result["had_error"] {
+      log_fn(tunnel["name"], "error: " + result["output"])
+    } else {
+      log_fn(tunnel["name"], "ssh exited cleanly")
+    }
+    if ran_seconds > 60 { backoff = server["retry_min"] }
+    if max_attempts != nil and attempts >= max_attempts { break }
+    log_fn(tunnel["name"], "reconnecting in " + str(backoff) + "s")
+    sleep_fn(backoff)
+    backoff = backoff * 2
+    if backoff > server["retry_max"] { backoff = server["retry_max"] }
+  }
+  return attempts
+}
