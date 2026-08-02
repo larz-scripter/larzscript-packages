@@ -24,12 +24,40 @@ forward - one tunnel reaches your whole reachable network).
 error markers (`ssh -N` is silent on success, so there's no exit code to
 wait on), and reconnects with exponential backoff.
 
-## Setting up a real relay, end to end
+## One script that does everything
 
-Verified against a real VPS before writing this down - not a
-theoretical walkthrough. Three steps: generate a key on the machine
-you're exposing, install it on the relay under a locked-down user, point
-`netbridge` at both.
+[`examples/setup_and_test.lz`](examples/setup_and_test.lz) - fill in 4
+lines at the top (your relay's address and a one-time-root SSH alias to
+it), run it, done: generates the client key if it doesn't have one yet,
+configures the relay (idempotent - safe to run every time), starts the
+tunnel in the background, then actually **tests** it - connects through
+the relay and checks for a real SSH banner, prints PASS/FAIL instead of
+just claiming success. Verified against a real VPS, twice in a row,
+before publishing this:
+
+```
+==> client key
+already have /home/elevenace/.ssh/netbridge_key
+==> configuring relay (larzserver)
+RELAY_SETUP_OK
+
+==> starting tunnel
+relay:2200  ->  127.0.0.1:22
+==> testing connection through the relay
+received: SSH-2.0-dropbear_2017.75
+
+PASS - the tunnel is live. From the relay: ssh -p 2200 you@127.0.0.1
+```
+
+(that `SSH-2.0-dropbear_2017.75` is real too - the actual banner the
+client machine's own `sshd` sent back, dropbear rather than OpenSSH on
+that particular box. Yours will show whatever your client runs.)
+
+## Setting up a real relay, by hand
+
+The same thing as the one-shot script above, broken into its three
+individual steps - useful if you want to understand or customize each
+piece rather than run the all-in-one version.
 
 **1. On the machine you want to expose** (the "client" - wherever this
 runs FROM):

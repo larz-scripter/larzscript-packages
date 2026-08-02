@@ -1,0 +1,96 @@
+# setup_and_test.lz - one script, does everything: generates the client
+# key if it doesn't exist yet, configures the relay (creates a locked-
+# down "tunnel" user there, installs the key - idempotent, safe to
+# re-run), starts the reverse tunnel in the background, and actually
+# tests it - connects through the relay and checks for a real SSH
+# banner, prints PASS/FAIL. Doesn't just claim the tunnel is up.
+#
+# Fill in the 4 lines below, then:
+#   larzscript setup_and_test.lz
+#
+# ROOT_SSH_ALIAS needs one-time root access to the relay to create the
+# tunnel user - an entry in your ~/.ssh/config, or swap the `ssh
+# ROOT_SSH_ALIAS` calls below for your own way of reaching it as root.
+# Once the tunnel user exists, ongoing use never needs root again.
+
+import "netbridge" as netbridge
+
+let ROOT_SSH_ALIAS = "myrelay"        # ssh config alias with root access, for one-time setup only
+let RELAY_HOST = "203.0.113.10"       # the relay's address (or hostname) - what netbridge itself connects to
+let RELAY_SSH_PORT = 22               # whatever port sshd listens on there
+let TUNNEL_PORT = 2200                # the port on the relay that will reach this machine
+let KEY_PATH = env("HOME", ".") + "/.ssh/netbridge_key"
+
+fn step(msg) { print("==> " + msg) }
+
+# ---- 1. client key ----
+step("client key")
+if not file_exists(KEY_PATH) {
+  run("ssh-keygen -t ed25519 -f " + KEY_PATH + " -N '' -C netbridge-client -q")
+  print("generated " + KEY_PATH)
+} else {
+  print("already have " + KEY_PATH)
+}
+let pubkey = read_file(KEY_PATH + ".pub").strip()
+
+# ---- 2. relay setup (idempotent - safe to run every time) ----
+step("configuring relay (" + ROOT_SSH_ALIAS + ")")
+let relay_script = "#!/bin/sh\nset -e\n" +
+  "TUNNEL_USER=tunnel\n" +
+  "PUBKEY='" + pubkey + "'\n" +
+  "id -u \"$TUNNEL_USER\" >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin \"$TUNNEL_USER\"\n" +
+  "install -d -m 700 -o \"$TUNNEL_USER\" -g \"$TUNNEL_USER\" \"/home/$TUNNEL_USER/.ssh\"\n" +
+  "touch \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+  "chmod 600 \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+  "chown \"$TUNNEL_USER:$TUNNEL_USER\" \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+  "grep -qF \"$PUBKEY\" \"/home/$TUNNEL_USER/.ssh/authorized_keys\" 2>/dev/null || " +
+  "printf 'no-pty,no-X11-forwarding,no-agent-forwarding,command=\"echo netbridge: no interactive shell\" %s\\n' \"$PUBKEY\" >> \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+  "echo RELAY_SETUP_OK\n"
+let relay_script_path = "/tmp/_netbridge_relay_setup.sh"
+write_file(relay_script_path, relay_script)
+let relay_out = capture("ssh " + ROOT_SSH_ALIAS + " 'bash -s' < " + relay_script_path)
+print(relay_out)
+if not relay_out.contains("RELAY_SETUP_OK") {
+  print("FAIL: relay setup did not confirm - see output above")
+  exit(1)
+}
+
+# ---- 3. free the tunnel port on the relay if a stale tunnel is holding it ----
+run("ssh " + ROOT_SSH_ALIAS + " \"pid=\\$(ss -tlnp 2>/dev/null | grep :" + str(TUNNEL_PORT) +
+    " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2); [ -n \\\"\\$pid\\\" ] && kill \\$pid 2>/dev/null; true\"")
+
+# ---- 4. start the tunnel, backgrounded, via netbridge's own command builder ----
+step("starting tunnel")
+let srv = netbridge.default_server()
+srv["host"] = RELAY_HOST
+srv["port"] = RELAY_SSH_PORT
+srv["user"] = "tunnel"
+srv["identity"] = KEY_PATH
+srv["known_hosts"] = env("HOME", ".") + "/.ssh/known_hosts"
+let shell = netbridge.tunnel_forward("my-shell", TUNNEL_PORT, "127.0.0.1", 22)
+print(netbridge.route_label(shell))
+let cmd = netbridge.build_ssh_command(srv, shell)
+run("nohup sh -c " + "'" + cmd.replace("'", "'\\''") + "'" +
+    " > /tmp/_netbridge_tunnel.log 2>&1 < /dev/null &")
+
+sleep(3)   # give it a moment to connect
+
+# ---- 5. test it for real: connect to the relay's forwarded port and
+# read back whatever's on the other end - a real SSH banner proves the
+# tunnel actually carries traffic, not just that a process is running ----
+step("testing connection through the relay")
+let test_cmd = "ssh " + ROOT_SSH_ALIAS + " \"timeout 4 bash -c 'exec 3<>/dev/tcp/127.0.0.1/" +
+    str(TUNNEL_PORT) + "; head -c 40 <&3'\""
+let banner = capture(test_cmd)
+print("received: " + banner)
+
+if banner.contains("SSH-") {
+  print("")
+  print("PASS - the tunnel is live. From the relay: ssh -p " + str(TUNNEL_PORT) + " you@127.0.0.1")
+} else {
+  print("")
+  print("FAIL - no SSH banner came back through the tunnel.")
+  print("tunnel log:")
+  print(capture("cat /tmp/_netbridge_tunnel.log 2>&1"))
+  exit(1)
+}
