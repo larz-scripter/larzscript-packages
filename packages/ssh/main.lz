@@ -19,8 +19,6 @@
 #   print(result["stdout"])
 #   ssh.disconnect(session)
 
-import "tcp" as tcp
-
 fn connect(host, port) { return ssh_open(host, port) }
 
 fn authenticate_with_password(session, user, password) { ssh_auth_password(session, user, password) }
@@ -83,11 +81,24 @@ fn disconnect(session) { ssh_close(session) }
 # `tcp` package's own "not concurrent" precedent) - a second incoming
 # connection waits until the first one closes.
 #
-# Known limit, stated plainly: forwarded data passes through Larzscript
-# string values, which are NUL-terminated C strings under the hood (see
-# psktunnel's README for the full explanation) - a real `0x00` byte in the
-# forwarded traffic will be silently truncated. Fine for text-oriented
-# protocols; not verified safe for arbitrary binary protocols.
+# The actual byte-shuttling (connect to target_host:target_port, then
+# bridge every byte both ways until either side closes) happens entirely
+# in C via ssh_bridge_forward() - not a Larzscript-level read/write loop.
+# That used to be the case, and it had a real, confirmed bug: forwarded
+# data passed through Larzscript string values, which have no stored
+# length (just a char* that's always NUL-terminated - see native/
+# larzscript.c's Value/Str) - any real 0x00 byte in the forwarded traffic
+# was silently truncated. Fine for the toy demos, but a real SSH session
+# tunneled through here (SSH's own wire protocol is binary, and 0x00
+# bytes show up routinely in real handshake packets) got its banner
+# through fine, then the very next binary KEX packet got truncated
+# mid-packet, corrupting the handshake and killing the connection -
+# caught via an actual live end-to-end test, not a hunch. Fixed by moving
+# the whole bridge into C, using raw buffers and real byte counts the
+# same way ssh_channel_shell() already had to for the interactive-shell
+# case. This also removed the old `import "tcp"` dependency this
+# function used to have (ssh_bridge_forward() dials the TCP target
+# itself) - one less thing to install.
 fn forward_remote_port(session, remote_port, target_host, target_port, opts={}) {
   let log = opts.has("log_fn") ? opts["log_fn"] : fn(line) { print(line) }
   ssh_listen_forward(session, remote_port)
@@ -97,27 +108,13 @@ fn forward_remote_port(session, remote_port, target_host, target_port, opts={}) 
     if channel == nil { continue }
     log("ssh: forwarded connection accepted, bridging")
     # Wrapped: without this, any error during one connection's lifetime
-    # (the local target refusing a connection, a channel read/write
-    # error) propagated all the way out of this function and killed the
-    # WHOLE tunnel - not just that one connection - taking the real ssh
-    # session (and the relay's remote-forward listener with it) down.
-    # Found via a real live test against a real relay, not assumed.
+    # (the target refusing a connection, a socket/channel error)
+    # propagated all the way out of this function and killed the WHOLE
+    # tunnel - not just that one connection - taking the real ssh session
+    # (and the relay's remote-forward listener with it) down. Found via a
+    # real live test against a real relay, not assumed.
     try {
-      let local_fd = socket_connect(target_host, target_port)
-      while true {
-        let avail = ssh_channel_poll(channel, 100)
-        if avail > 0 {
-          tcp.write_all(local_fd, ssh_channel_read(channel, avail))
-        }
-        if ssh_channel_eof(channel) { break }
-        let ready = socket_poll([local_fd], 100)
-        if ready.contains(local_fd) {
-          let data = socket_read(local_fd, 16384)
-          if data == "" { break }
-          ssh_channel_write(channel, data)
-        }
-      }
-      socket_close(local_fd)
+      ssh_bridge_forward(channel, target_host, target_port)
     } catch e {
       log("ssh: forwarded connection error: " + str(e))
     }

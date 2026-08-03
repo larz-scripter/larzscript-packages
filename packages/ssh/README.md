@@ -112,9 +112,18 @@ unavailable" responses, since this project never authenticates via
 GSSAPI. See `native/gssapi_stub.c` and `THIRD_PARTY_LICENSES.md` in the
 `larzscript` repo.
 
-`forward_remote_port()` currently supports one active forwarded connection
-at a time (matches the `tcp` package's own "not concurrent" precedent) -
-a second incoming connection waits until the first closes. `serve()`
+`forward_remote_port()` bridges the connection entirely in C
+(`ssh_bridge_forward()`) with real byte counts, not through Larzscript
+string values - genuine binary-safe forwarding, CI-verified with both an
+embedded-NUL-byte payload and a real independent `ssh` client fully
+authenticating and running a command through the tunnel (fixed after an
+earlier version silently truncated at the first `0x00` byte, corrupting
+real SSH traffic tunneled through it - caught via an actual live test,
+not assumed). No longer needs the `tcp` package as a dependency either.
+It supports one active forwarded connection at a time (matches the `tcp`
+package's own "not concurrent" precedent, for anything ELSE using `tcp`
+alongside this) - a second incoming connection waits until the first
+closes. `serve()`
 (server role) answers both exec commands and interactive shells (POSIX
 targets only - Windows still exec-only, see below) but password auth
 only - no server-side pubkey checking yet.
