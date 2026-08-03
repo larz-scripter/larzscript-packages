@@ -1,0 +1,116 @@
+# native_ssh_server_and_bridge.lz - the FULLY self-contained version of
+# native_ssh_setup.lz: instead of exposing a real sshd/RDP/whatever you
+# already have running on TARGET_HOST:TARGET_PORT, this machine's OWN
+# native SSH server (ssh.listen()/ssh.serve() - real interactive shell,
+# not just exec) IS the thing being exposed. Nothing to install on this
+# machine at all, on any of Linux/macOS/Windows - not OpenSSH, not
+# dropbear, not Windows' OpenSSH Server feature, nothing.
+#
+# Why two Larzscript processes, not one: this interpreter has no OS
+# threads (see the ssh/netbridge packages' own docs on why serve() and
+# forward_remote_port() each block forever, one connection at a time) -
+# a single process can't run the native SSH server's accept loop AND the
+# tunnel's forward loop at the same time. This script generates a small
+# companion script with your chosen port/password baked in, launches it
+# as a background OS process (the actual server), then this process
+# itself becomes the tunnel - one user-facing command still does both.
+#
+#   larzscript pkg install netbridge
+#   larzscript pkg install ssh
+#   nohup larzscript native_ssh_server_and_bridge.lz > ~/netbridge.log 2>&1 &
+#   (on Windows: just `larzscript native_ssh_server_and_bridge.lz`, no nohup/&)
+#
+# Stopping this does NOT stop the background native server (by design -
+# it's meant to keep answering local connections even if you stop the
+# tunnel). To stop both: kill this process, then find and kill the
+# `larzscript .../_native_ssh_server_worker.lz` process separately.
+
+import "ssh" as ssh
+
+# ---- fill these in ----
+let RELAY_HOST = "203.0.113.10"          # your relay's address or IP
+let RELAY_SSH_PORT = 22                   # whatever port sshd listens on there
+let RELAY_ROOT_USER = "root"
+let RELAY_ROOT_PASSWORD = "change-me"     # only used once, for setup
+let TUNNEL_PORT = 2200                    # the port on the relay that will reach this machine
+let LOCAL_SERVER_PORT = 2201              # this machine's OWN native ssh server listens here
+let LOCAL_SERVER_USER = "you"             # whatever username you want to log in as
+let LOCAL_SERVER_PASSWORD = "change-me-too"  # picks who can use the native server
+# (avoid a literal " in USER/PASSWORD - both get baked into a generated
+# .lz file as string literals below, and a stray quote would break that)
+# ------------------------
+
+let SSH_DIR = env("HOME", env("USERPROFILE", ".")) + "/.ssh"
+let KEY_PATH = SSH_DIR + "/netbridge_key"
+let KNOWN_HOSTS_PATH = SSH_DIR + "/known_hosts"
+let HOST_KEY_PATH = SSH_DIR + "/netbridge_local_server_host_key"
+let WORKER_PATH = SSH_DIR + "/_native_ssh_server_worker.lz"
+let is_windows = env("OS", "") == "Windows_NT"
+
+fn step(msg) { print("==> " + msg) }
+
+# ---- 1. client key ----
+step("client key")
+if not file_exists(KEY_PATH) {
+  run("ssh-keygen -t ed25519 -f \"" + KEY_PATH + "\" -N \"\" -C netbridge-client -q")
+  print("generated " + KEY_PATH)
+} else {
+  print("already have " + KEY_PATH)
+}
+let pubkey = read_file(KEY_PATH + ".pub").strip()
+
+# ---- 2. one-time relay setup, authenticated with your password ----
+step("setting up the relay (password, one time only, via ssh.run())")
+let relay_script = "#!/bin/sh\nset -e\n" +
+  "TUNNEL_USER=tunnel\n" +
+  "PUBKEY='" + pubkey + "'\n" +
+  "id -u \"$TUNNEL_USER\" >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin \"$TUNNEL_USER\"\n" +
+  "install -d -m 700 -o \"$TUNNEL_USER\" -g \"$TUNNEL_USER\" \"/home/$TUNNEL_USER/.ssh\"\n" +
+  "touch \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+  "chmod 600 \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+  "chown \"$TUNNEL_USER:$TUNNEL_USER\" \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+  "grep -qF \"$PUBKEY\" \"/home/$TUNNEL_USER/.ssh/authorized_keys\" 2>/dev/null || " +
+  "printf 'no-pty,no-X11-forwarding,no-agent-forwarding,command=\"echo netbridge: no interactive shell\" %s\\n' \"$PUBKEY\" >> \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+  "echo RELAY_SETUP_OK\n"
+
+let setup_session = ssh.connect(RELAY_HOST, RELAY_SSH_PORT)
+ssh.verify_host_trust_on_first_use(setup_session, KNOWN_HOSTS_PATH)
+ssh.authenticate_with_password(setup_session, RELAY_ROOT_USER, RELAY_ROOT_PASSWORD)
+let setup_result = ssh.run(setup_session, relay_script)
+print(setup_result["stdout"])
+if not setup_result["stdout"].contains("RELAY_SETUP_OK") {
+  print("FAIL: could not set up the relay - check RELAY_HOST/RELAY_SSH_PORT/RELAY_ROOT_PASSWORD.")
+  print(setup_result["stderr"])
+  exit(1)
+}
+ssh.disconnect(setup_session)
+
+# ---- 3. generate the worker script (this machine's native SSH server)
+# with your chosen port/user/password baked in as literal values, and
+# launch it as its own background OS process - see the file header for
+# why this needs to be a separate process, not a function call here. ----
+step("starting this machine's own native SSH server on port " + str(LOCAL_SERVER_PORT))
+let worker_script = "import \"ssh\" as ssh\n" +
+  "let server = ssh.listen(" + str(LOCAL_SERVER_PORT) + ", \"" + HOST_KEY_PATH + "\")\n" +
+  "ssh.serve(server,\n" +
+  "  fn(user, password) { return user == \"" + LOCAL_SERVER_USER + "\" and password == \"" + LOCAL_SERVER_PASSWORD + "\" },\n" +
+  "  fn(cmd) { return capture(cmd + \" 2>&1\") },\n" +
+  "  {\"log_fn\": fn(line) { print(\"[native ssh server] \" + line) }})\n"
+write_file(WORKER_PATH, worker_script)
+
+if is_windows {
+  run("start /B \"\" larzscript \"" + WORKER_PATH + "\"")
+} else {
+  run("larzscript \"" + WORKER_PATH + "\" > /dev/null 2>&1 &")
+}
+sleep(1)   # give it a moment to bind the port before the tunnel tries to reach it
+
+# ---- 4. connect to the relay - real ssh -R forwarding to THIS machine's
+# own native server, stays up ----
+step("connecting (real ssh -R through libssh - no external ssh process)")
+let session = ssh.connect(RELAY_HOST, RELAY_SSH_PORT)
+ssh.verify_host_trust_on_first_use(session, KNOWN_HOSTS_PATH)
+ssh.authenticate_with_key(session, "tunnel", KEY_PATH)
+print("relay:" + str(TUNNEL_PORT) + "  ->  this machine's native ssh server on 127.0.0.1:" + str(LOCAL_SERVER_PORT))
+print("from the relay: ssh -p " + str(TUNNEL_PORT) + " " + LOCAL_SERVER_USER + "@127.0.0.1   (real interactive shell, real pty)")
+ssh.forward_remote_port(session, TUNNEL_PORT, "127.0.0.1", LOCAL_SERVER_PORT)

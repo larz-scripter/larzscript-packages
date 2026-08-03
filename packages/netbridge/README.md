@@ -40,8 +40,10 @@ after uses the key it generated.
 Uses the [`ssh`](https://github.com/larz-scripter/larzscript-packages/tree/master/packages/ssh)
 package (real SSH via libssh, bound into the interpreter itself) for
 everything - `ssh.connect()`/`ssh.run()` for the one-time relay setup,
-`ssh.forward_remote_port()` for the tunnel. Nothing external runs at any
-point on any platform - no `ssh` binary, no `sshpass`, no WSL:
+`ssh.forward_remote_port()` for the tunnel, `ssh.verify_host_trust_on_first_use()`
+checking the relay's host key on every connection (not blind trust -
+fails closed if it ever changes). Nothing external runs at any point on
+any platform - no `ssh` binary, no `sshpass`, no WSL:
 
 ```
 larzscript pkg install netbridge
@@ -84,6 +86,21 @@ anything reachable on 127.0.0.1 (22 if you have Windows OpenSSH Server
 running, 3389 for RDP, etc.), so reach for the Windows-specific script
 only if you also want this script to install that Windows feature for
 you.
+
+### Nothing to install at all - not even a real sshd on the exposed machine
+
+[`examples/native_ssh_server_and_bridge.lz`](examples/native_ssh_server_and_bridge.lz) -
+for when the machine you're exposing has no real SSH server running (or
+you just don't want to set one up). Instead of forwarding to something
+that already exists on `TARGET_HOST:TARGET_PORT`, the "service" being
+exposed is this machine's OWN native `ssh.listen()`/`ssh.serve()` server -
+real interactive shell (`ssh -p 2200 you@127.0.0.1` lands on an actual
+login shell with a real pty, not just single commands), still nothing
+external anywhere. Two `larzscript` processes cooperate under one command
+(this interpreter has no OS threads, so the accept loop and the tunnel
+loop can't share a process) - one user-facing `nohup ... &` still starts
+both. See the file's own header comment for exactly how, and how to stop
+both cleanly.
 
 ## Setting up a real relay by hand, with your own SSH key
 

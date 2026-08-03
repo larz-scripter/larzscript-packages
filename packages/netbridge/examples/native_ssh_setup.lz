@@ -3,10 +3,19 @@
 # the `ssh` package (real SSH via libssh, bound into the interpreter
 # itself) for EVERYTHING - the one-time password-authenticated relay
 # setup AND the tunnel connection both go through
-# ssh.connect()/ssh.run()/ssh.forward_remote_port(). No shelling out to
-# the `ssh` binary, no `sshpass` dependency, no WSL, no per-OS variant
-# to maintain - nothing external at all beyond `larzscript` and two
-# Stack packages, on any of them.
+# ssh.connect()/ssh.run()/ssh.forward_remote_port(), with real host-key
+# verification (ssh.verify_host_trust_on_first_use()) on both. No
+# shelling out to the `ssh` binary, no `sshpass` dependency, no WSL, no
+# per-OS variant to maintain - nothing external at all beyond
+# `larzscript` and two Stack packages, on any of them.
+#
+# By default this exposes whatever real service is already listening on
+# TARGET_HOST:TARGET_PORT (a real sshd, RDP, etc.) - if the machine
+# you're exposing has NO real SSH server installed at all and you want
+# one anyway, see native_ssh_server_and_bridge.lz instead: same "no
+# external dependencies" story, but the "service" being exposed is
+# ITSELF a native larzscript SSH server (real interactive shell
+# included) rather than something you had to install separately.
 #
 # Needs the `ssh` package's native libssh binding, which - as of this
 # writing - covers every native target larzscript builds for: Linux
@@ -37,7 +46,9 @@ let TARGET_PORT = 22                      # ...and its port (e.g. 3389 for Windo
 # HOME isn't set by default in plain cmd/PowerShell - USERPROFILE is
 # Windows' equivalent. Forward slashes work fine in paths passed to
 # larzscript's own file/ssh-keygen calls on all three platforms.
-let KEY_PATH = env("HOME", env("USERPROFILE", ".")) + "/.ssh/netbridge_key"
+let SSH_DIR = env("HOME", env("USERPROFILE", ".")) + "/.ssh"
+let KEY_PATH = SSH_DIR + "/netbridge_key"
+let KNOWN_HOSTS_PATH = SSH_DIR + "/known_hosts"
 
 fn step(msg) { print("==> " + msg) }
 
@@ -73,7 +84,14 @@ let relay_script = "#!/bin/sh\nset -e\n" +
   "printf 'no-pty,no-X11-forwarding,no-agent-forwarding,command=\"echo netbridge: no interactive shell\" %s\\n' \"$PUBKEY\" >> \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
   "echo RELAY_SETUP_OK\n"
 
+# Trust-on-first-use is the right call here specifically: this is a
+# relay you just built, with no separate side-channel to verify a
+# fingerprint against. It still fails closed - throws, refuses to
+# proceed - the moment a previously-trusted key CHANGES, which is what
+# actually matters (catches a relay swap/MITM on every run AFTER the
+# first, not just blind trust forever).
 let setup_session = ssh.connect(RELAY_HOST, RELAY_SSH_PORT)
+ssh.verify_host_trust_on_first_use(setup_session, KNOWN_HOSTS_PATH)
 ssh.authenticate_with_password(setup_session, RELAY_ROOT_USER, RELAY_ROOT_PASSWORD)
 let setup_result = ssh.run(setup_session, relay_script)
 print(setup_result["stdout"])
@@ -87,6 +105,7 @@ ssh.disconnect(setup_session)
 # ---- 3. connect - real ssh -R forwarding, stays up ----
 step("connecting (real ssh -R through libssh - no external ssh process)")
 let session = ssh.connect(RELAY_HOST, RELAY_SSH_PORT)
+ssh.verify_host_trust_on_first_use(session, KNOWN_HOSTS_PATH)
 ssh.authenticate_with_key(session, "tunnel", KEY_PATH)
 print("relay:" + str(TUNNEL_PORT) + "  ->  " + TARGET_HOST + ":" + str(TARGET_PORT))
 ssh.forward_remote_port(session, TUNNEL_PORT, TARGET_HOST, TARGET_PORT)
