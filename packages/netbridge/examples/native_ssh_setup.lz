@@ -1,21 +1,21 @@
 # native_ssh_setup.lz - ONE script, same file, for Linux, macOS, AND
-# Windows - fill in 6 lines, run it, done, on whichever of the three
-# you're on. Uses the `ssh` package (real SSH via libssh, bound into
-# the interpreter itself) for EVERYTHING - the one-time
-# password-authenticated relay setup AND the tunnel connection both go
-# through ssh.connect()/ssh.run()/ssh.forward_remote_port(). No
-# shelling out to the `ssh` binary, no `sshpass` dependency, no WSL, no
-# per-OS variant to maintain - nothing external at all beyond
-# `larzscript` and two Stack packages, on any of the three.
+# Windows - fill in 6 lines, run it, done, on whichever you're on. Uses
+# the `ssh` package (real SSH via libssh, bound into the interpreter
+# itself) for EVERYTHING - the one-time password-authenticated relay
+# setup AND the tunnel connection both go through
+# ssh.connect()/ssh.run()/ssh.forward_remote_port(). No shelling out to
+# the `ssh` binary, no `sshpass` dependency, no WSL, no per-OS variant
+# to maintain - nothing external at all beyond `larzscript` and two
+# Stack packages, on any of them.
 #
 # Needs the `ssh` package's native libssh binding, which - as of this
-# writing - covers exactly those three: Linux x86_64, macOS (x86_64 +
-# arm64), and Windows x86_64, all CI-verified against a real independent
-# sshd/ssh client (see `ssh`'s own README for exact platform status;
-# every other platform throws a clear SshError). Not on one of those
-# three yet (Linux aarch64, wasm)? Use password_setup.lz instead
-# (shells to the real `ssh`/`sshpass` binaries, works everywhere those
-# do, just needs those installed).
+# writing - covers every native target larzscript builds for: Linux
+# (x86_64 + aarch64), macOS (x86_64 + arm64), and Windows x86_64, all
+# CI-verified against a real independent sshd/ssh client (see `ssh`'s
+# own README for exact platform status). On wasm (the one platform it
+# doesn't cover, permanently - no raw TCP in that sandbox)? Use
+# password_setup.lz instead (shells to the real `ssh`/`sshpass`
+# binaries, works everywhere those do, just needs those installed).
 #
 #   larzscript pkg install netbridge
 #   larzscript pkg install ssh

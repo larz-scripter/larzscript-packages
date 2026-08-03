@@ -64,32 +64,37 @@ hardware-adjacent crypto here).
 
 ## Platform status - read this before relying on it anywhere
 
-**Linux x86_64, macOS (x86_64 + arm64), and Windows x86_64** - client AND
-server role, all three verified live. Every function throws a plain,
-catchable `SshError` ("real SSH is not available in this build") on every
-other platform right now - Linux aarch64 and the web/wasm build (the
-latter permanently, by the same sandbox-has-no-raw-TCP reasoning as the
-`tcp`/`socket_*` builtins). Linux aarch64 is next.
+**Every native target larzscript builds for**: Linux x86_64, Linux
+aarch64, macOS (x86_64 + arm64), and Windows x86_64 - client AND server
+role, all five verified live. The only platform without real SSH is the
+web/wasm build, permanently, by the same sandbox-has-no-raw-TCP reasoning
+as the `tcp`/`socket_*` builtins - every `ssh_*` function throws a plain,
+catchable `SshError` ("real SSH is not available in this build") there.
 
-Windows was the hardest of the three: no mingw-w64 libssh package in
+Windows was the hardest of the five: no mingw-w64 libssh package in
 Ubuntu's apt repos, so CI fetches MSYS2's prebuilt `libssh.a` directly and
 links it with Ubuntu's mingw-w64 cross-compiler - a real toolchain-version
 mismatch (MSYS2's own, newer mingw-w64-crt vs. Ubuntu's older bundled one)
 surfaced a handful of missing symbols (`memset_explicit`, `strndup`,
 `isblank`, `fstat64i32`, `if_nametoindex`) that needed real compat shims,
 not stubs of SSH behavior itself - see `native/mingw_compat_stub.c` in the
-`larzscript` repo for exactly what and why.
+`larzscript` repo for exactly what and why. Linux aarch64, by contrast,
+just worked on the first attempt: Ubuntu's arm64 port
+(`ports.ubuntu.com`) ships the same `libssh-dev`/`libssl-dev`/
+`zlib1g-dev` packages as amd64, and the `aarch64-linux-gnu` cross-compiler
+picks the arm64 static archives up automatically via its default
+multiarch library path.
 
 Release binaries are fully static where that's the platform's own
-convention - Linux and Windows both verified (`ldd`'s "not a dynamic
-executable" on Linux; the Windows build links `-static` against the
-mingw-w64 runtime and MSYS2's static `libssh.a`/`libssl.a`/`libcrypto.a`/
-`libz.a`); macOS binaries are dynamic-against-libSystem by Apple's own
-convention (same as every other platform's macOS binary here) but libssh
-itself is statically linked from Homebrew's static `libssh.a`. None
-statically link Kerberos/GSSAPI - neither Ubuntu, Homebrew, nor MSYS2
-ships a static Kerberos library for this - a small stub instead provides
-those referenced-but-unused symbols with real RFC 2744 "facility
+convention - Linux (both architectures) and Windows all verified (`ldd`'s
+"not a dynamic executable" on Linux; the Windows build links `-static`
+against the mingw-w64 runtime and MSYS2's static `libssh.a`/`libssl.a`/
+`libcrypto.a`/`libz.a`); macOS binaries are dynamic-against-libSystem by
+Apple's own convention (same as every other platform's macOS binary here)
+but libssh itself is statically linked from Homebrew's static `libssh.a`.
+None statically link Kerberos/GSSAPI - neither Ubuntu, Homebrew, nor
+MSYS2 ships a static Kerberos library for this - a small stub instead
+provides those referenced-but-unused symbols with real RFC 2744 "facility
 unavailable" responses, since this project never authenticates via
 GSSAPI. See `native/gssapi_stub.c` and `THIRD_PARTY_LICENSES.md` in the
 `larzscript` repo.
@@ -115,10 +120,12 @@ password auth only - no server-side pubkey checking yet.
 
 All tested for real in CI against a live local `sshd`/real `ssh` client
 (real `openssh-server` or macOS's built-in `sshd`, key-based or password
-auth, throwaway keys), not stubs, on Linux x86_64, macOS, and Windows
-(the Windows binary run under Wine, whose winsock maps straight through
-to the runner's real network stack, talking to the same real Ubuntu
-`sshd`/`ssh` the Linux job uses):
+auth, throwaway keys), not stubs, on all five targets - Linux x86_64,
+Linux aarch64, macOS x86_64/arm64, and Windows x86_64 (the Windows binary
+run under Wine, the Linux aarch64 one under qemu-user-static - both
+translate syscalls, not a whole separate OS/VM, so their sockets map
+straight through to the runner's real network stack, talking to the same
+real Ubuntu `sshd`/`ssh` the native Linux job uses):
 
 - `ssh.run()`: `echo hello-from-real-sshd && whoami`, asserted against the
   actual returned `stdout` and `exit_status` (both correct).

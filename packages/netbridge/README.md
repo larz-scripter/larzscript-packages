@@ -27,7 +27,7 @@ wait on), and reconnects with exponential backoff.
 ## One script, one password, done - same file on Linux, macOS, or Windows
 
 [`examples/native_ssh_setup.lz`](examples/native_ssh_setup.lz) - the one
-script to reach for, on any of the three. Fill in 6 lines at the top
+script to reach for, on any of them. Fill in 6 lines at the top
 (relay host/port, root password, the port/service to expose), run it:
 generates its own client key, uses the password **once** to create a
 locked-down `tunnel` user on the relay (no shell, no X11/agent
@@ -52,10 +52,11 @@ nohup larzscript native_ssh_setup.lz > ~/netbridge.log 2>&1 &
 (on Windows: just `larzscript native_ssh_setup.lz` - no `nohup`/`&`.)
 
 Needs the `ssh` package's native libssh binding, which as of this
-writing covers exactly Linux x86_64, macOS (x86_64 + arm64), and Windows
-x86_64 - all three CI-verified end to end against a real independent
-`sshd`/`ssh` client (see `ssh`'s own README for exact status). Not on
-one of those three yet (Linux aarch64, wasm)? Use
+writing covers every native target larzscript builds for - Linux
+(x86_64 + aarch64), macOS (x86_64 + arm64), and Windows x86_64 - all
+CI-verified end to end against a real independent `sshd`/`ssh` client
+(see `ssh`'s own README for exact status). On the one platform it
+doesn't cover (wasm, permanently - no raw TCP in that sandbox)? Use
 [`examples/password_setup.lz`](examples/password_setup.lz) instead -
 same 4-field flow, shells out to the real `ssh`/`sshpass` binaries
 instead, works wherever those are installed (`apt install sshpass`),
