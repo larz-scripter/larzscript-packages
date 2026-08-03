@@ -35,7 +35,9 @@ ssh.forward_remote_port(session, 2200, "127.0.0.1", 22)
 ```
 
 The server role - this machine answers `ssh user@this-machine cmd` with real
-command output, no OpenSSH/dropbear/anything external installed:
+command output, AND `ssh user@this-machine` (no command) with a real
+interactive login shell - real pty, real job control - no OpenSSH/dropbear/
+anything external installed either way:
 
 ```
 import "ssh" as ssh
@@ -44,6 +46,17 @@ let server = ssh.listen(22, "/etc/ssh_host_key")   # generates the key on first 
 ssh.serve(server,
   fn(user, password) { return password == "hunter2" },   # check_password
   fn(cmd) { return capture(cmd + " 2>&1") })              # run_command
+```
+
+Client-side host-key verification, so a connection isn't blindly trusted:
+
+```
+import "ssh" as ssh
+
+let session = ssh.connect("myserver.com", 22)
+ssh.verify_host_trust_on_first_use(session, env("HOME", ".") + "/.ssh/known_hosts")
+# throws if the key CHANGED since last connecting - never silently proceeds
+ssh.authenticate_with_key(session, "root", "~/.ssh/id_ed25519")
 ```
 
 ## Why libssh, not a pure-Larzscript implementation
@@ -102,19 +115,28 @@ GSSAPI. See `native/gssapi_stub.c` and `THIRD_PARTY_LICENSES.md` in the
 `forward_remote_port()` currently supports one active forwarded connection
 at a time (matches the `tcp` package's own "not concurrent" precedent) -
 a second incoming connection waits until the first closes. `serve()`
-(server role) is exec-only for now - no interactive pty/shell - and
-password auth only - no server-side pubkey checking yet.
+(server role) answers both exec commands and interactive shells (POSIX
+targets only - Windows still exec-only, see below) but password auth
+only - no server-side pubkey checking yet.
+
+Interactive shell (`ssh_channel_shell()` under the hood) is real
+`fork()`+`forkpty()` - Linux (x86_64 + aarch64) and macOS (x86_64 +
+arm64) only. Windows has no `fork()`/pty; a real equivalent needs
+ConPTY (`CreatePseudoConsole`), a wholly different Win32 API, not built
+yet - `serve()` there still answers exec commands correctly, but denies
+a shell request instead of crashing (CI-verified: `ssh_channel_shell()`
+throws the documented, catchable `SshError`).
 
 ## Not yet implemented
 
-- **Host key verification** (client side) - connections aren't checked
-  against a known-hosts file yet. Stated plainly: this is a real security
-  gap for this phase, not silently glossed over.
 - **Server-side pubkey auth** - `serve()` only checks passwords for now.
-- **Interactive shell/pty** - `serve()` handles `exec` requests
-  (`ssh host cmd`), not an interactive login shell.
+- **Interactive shell on Windows** - needs ConPTY, see above; exec works
+  there today.
 - **Concurrent forwarded connections** - `forward_remote_port()` is one at
   a time for now, see above.
+- **Window-resize during a live interactive session** - the pty is sized
+  correctly at the START of the session (from the client's pty-request),
+  but a live terminal resize mid-session isn't propagated yet.
 
 ## Verified
 
@@ -132,11 +154,18 @@ real Ubuntu `sshd`/`ssh` the native Linux job uses):
 - `ssh.forward_remote_port()`: a real local TCP echo service, forwarded
   through a real sshd's remote port, reached by an external client - the
   real banner and a real echoed payload both round-tripped correctly.
-- `ssh.listen()`/`ssh.serve()` (server role): the actual system `ssh`
+- `ssh.listen()`/`ssh.serve()` (server role, exec): the actual system `ssh`
   binary (a completely independent SSH client, not our own) connected,
   password-authenticated, and ran `echo hello-from-native-server` against
   our native server - real output round-tripped, proving genuine protocol
   interop, not just "our client talks to our server".
+- `ssh.listen()`/`ssh.serve()` (server role, interactive shell): the real
+  system `ssh` client with `-tt` (forces pty allocation even with no real
+  terminal in CI) typed a command into the actual shell our server spawned
+  via `forkpty()` - the echoed input and command output both round-tripped
+  correctly, proving a genuine interactive session, not exec dressed up as
+  one. Windows checked separately: confirmed `ssh_channel_shell()` fails
+  the documented, catchable way there instead of crashing or hanging.
 
 See `.github/workflows/native.yml`'s "Verify ssh..." steps in the
 `larzscript` repo for the exact tests that ran.
