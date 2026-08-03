@@ -27,6 +27,44 @@ fn authenticate_with_password(session, user, password) { ssh_auth_password(sessi
 
 fn authenticate_with_key(session, user, key_path) { ssh_auth_key(session, user, key_path) }
 
+# Host-key verification (client side) - checks the connected server's
+# key against `known_hosts_path`, using libssh's own known_hosts
+# implementation (not hand-rolled). Call this AFTER connect() (the key
+# exchange already happened by then) and BEFORE any authenticate_*()
+# call. Returns one of: "ok" (matches a known entry), "changed" (the
+# key is DIFFERENT from what's on record for this host - the real
+# MITM-detection case, never silently proceed on this one), "unknown"
+# (host isn't in the file yet - normal on first connect), "not_found"
+# (no known_hosts file yet), "other" (host known, but not with this key
+# type), "error".
+fn check_host(session, known_hosts_path) { return ssh_check_host(session, known_hosts_path) }
+
+# Records the server's CURRENT key into known_hosts (creating the
+# file/directory if it doesn't exist). Only call this once YOU'VE
+# decided it's safe - e.g. after showing the user a fingerprint to
+# confirm, or as a deliberate trust-on-first-use policy. Never call this
+# on a "changed" result - see verify_host_trust_on_first_use() below for
+# the common convenience case that gets this right automatically.
+fn trust_host(session, known_hosts_path) { ssh_trust_host(session, known_hosts_path) }
+
+# Convenience wrapper for the common case (a relay/server you just set
+# up, no separate side-channel to verify a fingerprint against): trusts
+# the key the FIRST time it's seen, and fails closed - throws, never
+# silently proceeds - the moment a previously-trusted key changes. NOT a
+# substitute for real out-of-band verification against a host you don't
+# control; for that, call check_host()/trust_host() directly and show
+# the user a real prompt instead of auto-trusting.
+fn verify_host_trust_on_first_use(session, known_hosts_path) {
+  let status = ssh_check_host(session, known_hosts_path)
+  if status == "changed" {
+    throw {"type": "SshHostKeyError", "message": "host key for this server has CHANGED since it was last recorded in " + known_hosts_path + " - refusing to connect (possible MITM). Only remove the stale entry if you're SURE this is expected (e.g. the server was rebuilt)."}
+  }
+  if status == "unknown" or status == "not_found" {
+    ssh_trust_host(session, known_hosts_path)
+  }
+  return status
+}
+
 # Runs `cmd` on the remote host and waits for it to finish. Returns
 # {"stdout": ..., "stderr": ..., "exit_status": ...} - the command's real
 # output and real exit code, not just whether the SSH request itself
@@ -91,11 +129,15 @@ fn forward_remote_port(session, remote_port, target_host, target_port, opts={}) 
 # ==================== server role ====================
 #
 # A real SSH server - this machine answers `ssh user@this-machine cmd`
-# with real command output, no OpenSSH/dropbear/anything external
-# installed. v1 scope: password auth only (no server-side pubkey
-# checking yet), exec only (no interactive pty/shell - `ssh host cmd`
-# works, an interactive `ssh host` login shell doesn't). One connection
-# at a time, matching the `tcp` package's own precedent.
+# with real command output, AND `ssh user@this-machine` (no command) with
+# a real interactive login shell - a real pty, real job control, resizes
+# correctly - no OpenSSH/dropbear/anything external installed on this
+# machine either way. v1 scope: password auth only (no server-side
+# pubkey checking yet). One connection at a time, matching the `tcp`
+# package's own precedent. Interactive shell is POSIX only (Linux,
+# macOS) - Windows has no fork()/pty; a real ConPTY-based equivalent
+# isn't built yet, so a Windows server still answers exec commands fine
+# but denies shell requests (see native/larzscript.c's LARZ_HAVE_PTY).
 #
 # Generates a host key on first use if `host_key_path` doesn't exist yet
 # - same as any real sshd needs one.
@@ -112,14 +154,19 @@ fn listen(port, host_key_path) {
 }
 
 # Runs forever: accepts one client at a time, authenticates it via
-# `check_password(user, password) -> bool`, then for each command it
-# execs, calls `run_command(cmd) -> string` and sends that back as the
+# `check_password(user, password) -> bool`. For each command it execs,
+# calls `run_command(cmd) -> string` and sends that back as the
 # command's real output (exit status always 0 for v1 - the caller's
 # run_command is responsible for encoding failure into its own output if
 # it wants to; a future version could let run_command return a
-# {"output":, "exit_status":} dict instead).
+# {"output":, "exit_status":} dict instead). For an interactive login
+# (no command - `ssh user@host`), spawns a real shell attached to a real
+# pty (see ssh_channel_shell() in native/larzscript.c) - pass
+# `opts["allow_shell"] = false` to disable this and answer exec commands
+# only (matches the old v1 exec-only behavior).
 fn serve(bind, check_password, run_command, opts={}) {
   let log = opts.has("log_fn") ? opts["log_fn"] : fn(line) { print(line) }
+  let allow_shell = opts.has("allow_shell") ? opts["allow_shell"] : true
   while true {
     let session = nil
     try {
@@ -130,7 +177,7 @@ fn serve(bind, check_password, run_command, opts={}) {
     }
     log("ssh server: client connected")
     try {
-      _serve_session(session, check_password, run_command, log)
+      _serve_session(session, check_password, run_command, allow_shell, log)
     } catch e {
       log("ssh server: session ended: " + str(e))
     }
@@ -138,9 +185,11 @@ fn serve(bind, check_password, run_command, opts={}) {
   }
 }
 
-fn _serve_session(session, check_password, run_command, log) {
+fn _serve_session(session, check_password, run_command, allow_shell, log) {
   let authenticated = false
   let channel = nil
+  let pty_cols = 80
+  let pty_rows = 24
   while true {
     let msg = ssh_server_next_message(session)
     if msg == nil { return }
@@ -157,6 +206,41 @@ fn _serve_session(session, check_password, run_command, log) {
       }
     } else if t == "channel_open" {
       if not authenticated { ssh_msg_deny(msg) } else { channel = ssh_msg_channel_accept(msg) }
+    } else if t == "pty" {
+      if not authenticated or not allow_shell {
+        ssh_msg_deny(msg)
+      } else {
+        # Client's requested terminal size - read BEFORE accepting, so a
+        # follow-up "shell" request sizes the pty right from the start
+        # instead of starting at a default and needing a manual resize.
+        pty_cols = ssh_msg_pty_width(msg)
+        pty_rows = ssh_msg_pty_height(msg)
+        ssh_msg_request_accept(msg)
+      }
+    } else if t == "shell" {
+      if not authenticated or not allow_shell {
+        ssh_msg_deny(msg)
+      } else {
+        let ch = ssh_msg_channel(msg)
+        ssh_msg_request_accept(msg)
+        log("ssh server: interactive shell requested (" + str(pty_cols) + "x" + str(pty_rows) + ")")
+        # Wrapped: ssh_channel_shell() throws on platforms without pty
+        # support (Windows - no fork()/ConPTY yet, see the file header
+        # above). Without this, that error would propagate out of the
+        # whole session (killing exec too, on the SAME connection) rather
+        # than just failing the one shell request - same reasoning
+        # forward_remote_port()'s own try/catch documents.
+        try {
+          let exit_code = ssh_channel_shell(ch, pty_cols, pty_rows)
+          ssh_channel_send_exit_status(ch, exit_code)
+        } catch e {
+          log("ssh server: interactive shell failed: " + str(e))
+          ssh_channel_write(ch, "no interactive shell available on this server (" + str(e) + ") - try running a single command instead\n")
+          ssh_channel_send_exit_status(ch, 1)
+        }
+        ssh_channel_close(ch)
+        ssh_channel_free(ch)
+      }
     } else if t == "exec" {
       let cmd = ssh_msg_exec_command(msg)
       let ch = ssh_msg_channel(msg)
