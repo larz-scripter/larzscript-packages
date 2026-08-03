@@ -87,3 +87,88 @@ fn forward_remote_port(session, remote_port, target_host, target_port, opts={}) 
     log("ssh: forwarded connection closed")
   }
 }
+
+# ==================== server role ====================
+#
+# A real SSH server - this machine answers `ssh user@this-machine cmd`
+# with real command output, no OpenSSH/dropbear/anything external
+# installed. v1 scope: password auth only (no server-side pubkey
+# checking yet), exec only (no interactive pty/shell - `ssh host cmd`
+# works, an interactive `ssh host` login shell doesn't). One connection
+# at a time, matching the `tcp` package's own precedent.
+#
+# Generates a host key on first use if `host_key_path` doesn't exist yet
+# - same as any real sshd needs one.
+
+fn listen(port, host_key_path) {
+  if not file_exists(host_key_path) {
+    # capture(), not run(): this package's own run(session, cmd) function
+    # (below) shadows the global run() shell builtin for any unqualified
+    # call from within this file - found via a real test, not assumed.
+    # capture() isn't shadowed by anything here.
+    capture("ssh-keygen -t ed25519 -f " + host_key_path + " -N '' -q")
+  }
+  return ssh_bind_open(port, host_key_path)
+}
+
+# Runs forever: accepts one client at a time, authenticates it via
+# `check_password(user, password) -> bool`, then for each command it
+# execs, calls `run_command(cmd) -> string` and sends that back as the
+# command's real output (exit status always 0 for v1 - the caller's
+# run_command is responsible for encoding failure into its own output if
+# it wants to; a future version could let run_command return a
+# {"output":, "exit_status":} dict instead).
+fn serve(bind, check_password, run_command, opts={}) {
+  let log = opts.has("log_fn") ? opts["log_fn"] : fn(line) { print(line) }
+  while true {
+    let session = nil
+    try {
+      session = ssh_bind_accept_session(bind)
+    } catch e {
+      log("ssh server: accept failed: " + str(e))
+      continue
+    }
+    log("ssh server: client connected")
+    try {
+      _serve_session(session, check_password, run_command, log)
+    } catch e {
+      log("ssh server: session ended: " + str(e))
+    }
+    ssh_close(session)
+  }
+}
+
+fn _serve_session(session, check_password, run_command, log) {
+  let authenticated = false
+  let channel = nil
+  while true {
+    let msg = ssh_server_next_message(session)
+    if msg == nil { return }
+    let t = ssh_msg_type(msg)
+    if t == "auth_password" {
+      let user = ssh_msg_auth_user(msg)
+      let password = ssh_msg_auth_password(msg)
+      if check_password(user, password) {
+        authenticated = true
+        ssh_msg_auth_accept(msg)
+        log("ssh server: " + user + " authenticated")
+      } else {
+        ssh_msg_deny(msg)
+      }
+    } else if t == "channel_open" {
+      if not authenticated { ssh_msg_deny(msg) } else { channel = ssh_msg_channel_accept(msg) }
+    } else if t == "exec" {
+      let cmd = ssh_msg_exec_command(msg)
+      let ch = ssh_msg_channel(msg)
+      ssh_msg_request_accept(msg)
+      log("ssh server: exec " + cmd)
+      let output = run_command(cmd)
+      ssh_channel_write(ch, output)
+      ssh_channel_send_exit_status(ch, 0)
+      ssh_channel_close(ch)
+      ssh_channel_free(ch)
+    } else {
+      ssh_msg_deny(msg)
+    }
+  }
+}
