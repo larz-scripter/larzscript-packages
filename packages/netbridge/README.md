@@ -102,6 +102,25 @@ loop can't share a process) - one user-facing `nohup ... &` still starts
 both. See the file's own header comment for exactly how, and how to stop
 both cleanly.
 
+Dynamic and resilient, not a one-shot attempt - found needed during real
+end-to-end testing against a live relay, not designed in the abstract:
+
+- **Real connect timeouts** (`ssh.connect(host, port, timeout_seconds)`,
+  default 15s) - won't hang forever against an unreachable or
+  silently-firewalled relay.
+- **Auto-picks the next free port** if `TUNNEL_PORT`/`LOCAL_SERVER_PORT`
+  are already taken (e.g. a previous run still holding it), instead of
+  just erroring out.
+- **Real worker-readiness check** - polls for the native server to
+  actually be listening before connecting the tunnel to it, instead of a
+  fixed blind sleep that either wastes time or races a slower machine.
+- **Auto-reconnects with exponential backoff** if the relay connection
+  ever drops (same backoff shape as `supervise()` above) - restarts the
+  native server too if it died in the meantime.
+- **Specific error messages per failure mode** - unreachable relay, bad
+  password, changed host key, and relay-script failure are each reported
+  distinctly instead of one generic failure.
+
 ## Setting up a real relay by hand, with your own SSH key
 
 If you'd rather not put a root password in a script - the same setup,

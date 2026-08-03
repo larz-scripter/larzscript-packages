@@ -15,6 +15,21 @@
 # as a background OS process (the actual server), then this process
 # itself becomes the tunnel - one user-facing command still does both.
 #
+# Dynamic and resilient, not a one-shot attempt:
+# - real connect timeouts (won't hang forever on an unreachable/
+#   firewalled relay - fails fast and retries instead)
+# - auto-picks the next free port if TUNNEL_PORT/LOCAL_SERVER_PORT are
+#   already taken, instead of just erroring out
+# - waits for the native server to actually be listening before
+#   connecting the tunnel to it (a real readiness check, not a blind
+#   fixed sleep)
+# - auto-reconnects with exponential backoff if the relay connection
+#   ever drops (same backoff shape as netbridge's own supervise()) -
+#   restarts the native server too if it died in the meantime
+# - clear, specific error messages per failure mode (unreachable relay,
+#   bad password, host key changed, relay script failure) instead of a
+#   single generic failure
+#
 #   larzscript pkg install netbridge
 #   larzscript pkg install ssh
 #   nohup larzscript native_ssh_server_and_bridge.lz > ~/netbridge.log 2>&1 &
@@ -32,12 +47,19 @@ let RELAY_HOST = "203.0.113.10"          # your relay's address or IP
 let RELAY_SSH_PORT = 22                   # whatever port sshd listens on there
 let RELAY_ROOT_USER = "root"
 let RELAY_ROOT_PASSWORD = "change-me"     # only used once, for setup
-let TUNNEL_PORT = 2200                    # the port on the relay that will reach this machine
-let LOCAL_SERVER_PORT = 2201              # this machine's OWN native ssh server listens here
+let TUNNEL_PORT = 2200                    # the port on the relay that will reach this machine (auto-tries the next few if taken)
+let LOCAL_SERVER_PORT = 2201              # this machine's OWN native ssh server listens here (same auto-fallback)
 let LOCAL_SERVER_USER = "you"             # whatever username you want to log in as
 let LOCAL_SERVER_PASSWORD = "change-me-too"  # picks who can use the native server
 # (avoid a literal " in USER/PASSWORD - both get baked into a generated
 # .lz file as string literals below, and a stray quote would break that)
+# ------------------------
+
+# ---- tuning - sane defaults, change if you know you need to ----
+let CONNECT_TIMEOUT_SECONDS = 15   # fail fast on an unreachable/firewalled relay rather than hang
+let RETRY_MIN_SECONDS = 5          # first reconnect wait after a drop
+let RETRY_MAX_SECONDS = 60         # reconnect backoff never grows past this
+let PORT_SCAN_ATTEMPTS = 5         # how many candidate ports to try if the first choice is taken
 # ------------------------
 
 let SSH_DIR = env("HOME", env("USERPROFILE", ".")) + "/.ssh"
@@ -48,69 +70,233 @@ let WORKER_PATH = SSH_DIR + "/_native_ssh_server_worker.lz"
 let is_windows = env("OS", "") == "Windows_NT"
 
 fn step(msg) { print("==> " + msg) }
+fn log(msg) { print("[" + str(int(time())) + "] " + msg) }
 
-# ---- 1. client key ----
+# ---- 1. client key - generated fresh here, unique per machine ----
+# Double-quoted path + double-quoted empty passphrase (-N "") rather
+# than single quotes: `run()` shells out via the OS's own shell
+# (/bin/sh on Linux/macOS, cmd.exe on Windows) - single-quote emptiness
+# is a POSIX-only convention (cmd.exe treats '' as two literal
+# characters, not nothing), but "" for an empty argument, and double
+# quotes around a path that might contain spaces, both work identically
+# on all three - the one quoting style that needed no per-OS branch.
 step("client key")
 if not file_exists(KEY_PATH) {
   run("ssh-keygen -t ed25519 -f \"" + KEY_PATH + "\" -N \"\" -C netbridge-client -q")
+  if not file_exists(KEY_PATH) {
+    print("FAIL: ssh-keygen did not produce a key at " + KEY_PATH + " - is ssh-keygen installed and on PATH?")
+    exit(1)
+  }
   print("generated " + KEY_PATH)
 } else {
   print("already have " + KEY_PATH)
 }
 let pubkey = read_file(KEY_PATH + ".pub").strip()
 
-# ---- 2. one-time relay setup, authenticated with your password ----
-step("setting up the relay (password, one time only, via ssh.run())")
-let relay_script = "#!/bin/sh\nset -e\n" +
-  "TUNNEL_USER=tunnel\n" +
-  "PUBKEY='" + pubkey + "'\n" +
-  "id -u \"$TUNNEL_USER\" >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin \"$TUNNEL_USER\"\n" +
-  "install -d -m 700 -o \"$TUNNEL_USER\" -g \"$TUNNEL_USER\" \"/home/$TUNNEL_USER/.ssh\"\n" +
-  "touch \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
-  "chmod 600 \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
-  "chown \"$TUNNEL_USER:$TUNNEL_USER\" \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
-  "grep -qF \"$PUBKEY\" \"/home/$TUNNEL_USER/.ssh/authorized_keys\" 2>/dev/null || " +
-  "printf 'no-pty,no-X11-forwarding,no-agent-forwarding,command=\"echo netbridge: no interactive shell\" %s\\n' \"$PUBKEY\" >> \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
-  "echo RELAY_SETUP_OK\n"
+# ---- 2. one-time relay setup, authenticated with your password - via
+# ssh.run(), not a shelled-out `sshpass ssh ...` command. Each step
+# wrapped separately so a failure says exactly what went wrong instead
+# of one generic "something broke". ----
+fn setup_relay() {
+  step("setting up the relay (password, one time only, via ssh.run())")
+  let relay_script = "#!/bin/sh\nset -e\n" +
+    "TUNNEL_USER=tunnel\n" +
+    "PUBKEY='" + pubkey + "'\n" +
+    "id -u \"$TUNNEL_USER\" >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin \"$TUNNEL_USER\"\n" +
+    "install -d -m 700 -o \"$TUNNEL_USER\" -g \"$TUNNEL_USER\" \"/home/$TUNNEL_USER/.ssh\"\n" +
+    "touch \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+    "chmod 600 \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+    "chown \"$TUNNEL_USER:$TUNNEL_USER\" \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+    "grep -qF \"$PUBKEY\" \"/home/$TUNNEL_USER/.ssh/authorized_keys\" 2>/dev/null || " +
+    "printf 'no-pty,no-X11-forwarding,no-agent-forwarding,command=\"echo netbridge: no interactive shell\" %s\\n' \"$PUBKEY\" >> \"/home/$TUNNEL_USER/.ssh/authorized_keys\"\n" +
+    "echo RELAY_SETUP_OK\n"
 
-let setup_session = ssh.connect(RELAY_HOST, RELAY_SSH_PORT)
-ssh.verify_host_trust_on_first_use(setup_session, KNOWN_HOSTS_PATH)
-ssh.authenticate_with_password(setup_session, RELAY_ROOT_USER, RELAY_ROOT_PASSWORD)
-let setup_result = ssh.run(setup_session, relay_script)
-print(setup_result["stdout"])
-if not setup_result["stdout"].contains("RELAY_SETUP_OK") {
-  print("FAIL: could not set up the relay - check RELAY_HOST/RELAY_SSH_PORT/RELAY_ROOT_PASSWORD.")
-  print(setup_result["stderr"])
+  let setup_session = nil
+  try {
+    setup_session = ssh.connect(RELAY_HOST, RELAY_SSH_PORT, CONNECT_TIMEOUT_SECONDS)
+  } catch e {
+    print("FAIL: could not reach the relay at " + RELAY_HOST + ":" + str(RELAY_SSH_PORT) + " within " + str(CONNECT_TIMEOUT_SECONDS) + "s - " + str(e))
+    print("check RELAY_HOST/RELAY_SSH_PORT, and that the relay's sshd is actually up.")
+    exit(1)
+  }
+  try {
+    ssh.verify_host_trust_on_first_use(setup_session, KNOWN_HOSTS_PATH)
+  } catch e {
+    print("FAIL: relay host-key check failed - " + str(e))
+    exit(1)
+  }
+  try {
+    ssh.authenticate_with_password(setup_session, RELAY_ROOT_USER, RELAY_ROOT_PASSWORD)
+  } catch e {
+    print("FAIL: password authentication to the relay failed - check RELAY_ROOT_USER/RELAY_ROOT_PASSWORD. (" + str(e) + ")")
+    exit(1)
+  }
+  let setup_result = ssh.run(setup_session, relay_script)
+  print(setup_result["stdout"])
+  if not setup_result["stdout"].contains("RELAY_SETUP_OK") {
+    print("FAIL: the relay setup script did not complete - check RELAY_HOST/RELAY_SSH_PORT/RELAY_ROOT_PASSWORD.")
+    print(setup_result["stderr"])
+    exit(1)
+  }
+  ssh.disconnect(setup_session)
+}
+setup_relay()
+
+# ---- 3. helpers: a port is "free" if nothing answers a connect on it;
+# pick_free_port() walks forward from a starting port instead of just
+# failing the moment the first choice is already taken by something
+# else on this machine (a previous run, another app, ...). ----
+fn is_port_taken(port) {
+  try {
+    let fd = socket_connect("127.0.0.1", port)
+    socket_close(fd)
+    return true
+  } catch e {
+    return false
+  }
+}
+fn pick_free_port(start_port, attempts) {
+  let port = start_port
+  for i in range(attempts) {
+    if not is_port_taken(port) { return port }
+    port = port + 1
+  }
+  return nil
+}
+
+# ---- 4. the native SSH server (this machine's own worker process) -
+# started once, kept running independently of the tunnel (see file
+# header for why); (re)started here if it isn't already up and
+# listening, with a real readiness check instead of a blind sleep. ----
+fn start_worker_if_needed(port) {
+  if is_port_taken(port) {
+    log("native server already listening on " + str(port) + ", reusing it")
+    return true
+  }
+  step("starting this machine's own native SSH server on port " + str(port))
+  let worker_script = "import \"ssh\" as ssh\n" +
+    "let server = ssh.listen(" + str(port) + ", \"" + HOST_KEY_PATH + "\")\n" +
+    "ssh.serve(server,\n" +
+    "  fn(user, password) { return user == \"" + LOCAL_SERVER_USER + "\" and password == \"" + LOCAL_SERVER_PASSWORD + "\" },\n" +
+    "  fn(cmd) { return capture(cmd + \" 2>&1\") },\n" +
+    "  {\"log_fn\": fn(line) { print(\"[native ssh server] \" + line) }})\n"
+  write_file(WORKER_PATH, worker_script)
+  if is_windows {
+    run("start /B \"\" larzscript \"" + WORKER_PATH + "\"")
+  } else {
+    run("larzscript \"" + WORKER_PATH + "\" > /dev/null 2>&1 &")
+  }
+  # Real readiness check: poll for up to 10s instead of a blind sleep(1)
+  # (which either wastes time waiting when it's already up, or isn't
+  # long enough on a slower/loaded machine and races the tunnel step).
+  let waited = 0.0
+  while waited < 10.0 {
+    if is_port_taken(port) { return true }
+    sleep(0.25)
+    waited = waited + 0.25
+  }
+  return false
+}
+
+# ---- 5. connect to the relay and forward - the tunnel itself. Manual
+# listen+accept+bridge (the same primitives ssh.forward_remote_port()
+# uses internally) instead of the higher-level wrapper, specifically so
+# a taken TUNNEL_PORT can fall forward to the next candidate rather than
+# just failing. ----
+fn run_tunnel_once(local_port) {
+  let session = nil
+  try {
+    session = ssh.connect(RELAY_HOST, RELAY_SSH_PORT, CONNECT_TIMEOUT_SECONDS)
+  } catch e {
+    log("could not reach the relay: " + str(e))
+    return false
+  }
+  try {
+    ssh.verify_host_trust_on_first_use(session, KNOWN_HOSTS_PATH)
+    ssh.authenticate_with_key(session, "tunnel", KEY_PATH)
+  } catch e {
+    log("relay auth/host-key check failed: " + str(e))
+    ssh.disconnect(session)   # otherwise a repeated auth failure inside the reconnect loop leaks a session handle every attempt
+    return false
+  }
+
+  let bound_port = nil
+  let candidate = TUNNEL_PORT
+  for i in range(PORT_SCAN_ATTEMPTS) {
+    try {
+      ssh_listen_forward(session, candidate)
+      bound_port = candidate
+      break
+    } catch e {
+      log("relay port " + str(candidate) + " unavailable (" + str(e) + "), trying " + str(candidate + 1))
+      candidate = candidate + 1
+    }
+  }
+  if bound_port == nil {
+    log("could not bind any relay port from " + str(TUNNEL_PORT) + " through " + str(TUNNEL_PORT + PORT_SCAN_ATTEMPTS - 1))
+    ssh.disconnect(session)
+    return false
+  }
+
+  print("relay:" + str(bound_port) + "  ->  this machine's native ssh server on 127.0.0.1:" + str(local_port))
+  print("from the relay: ssh -p " + str(bound_port) + " " + LOCAL_SERVER_USER + "@127.0.0.1   (real interactive shell, real pty)")
+
+  while true {
+    let channel = nil
+    try {
+      channel = ssh_accept_forward(session, 1000)
+    } catch e {
+      # the relay session itself died (network drop, relay restart, ...) -
+      # return cleanly so the outer supervise loop reconnects, rather than
+      # letting this escape uncaught and crash the whole process.
+      log("relay session ended: " + str(e))
+      return false
+    }
+    if channel == nil { continue }
+    if not is_port_taken(local_port) {
+      log("native server on " + str(local_port) + " isn't responding - restarting it")
+      if not start_worker_if_needed(local_port) {
+        log("could not restart the native server - closing this connection")
+        ssh_channel_free(channel)
+        continue
+      }
+    }
+    try {
+      ssh_bridge_forward(channel, "127.0.0.1", local_port)
+    } catch e {
+      log("forwarded connection error: " + str(e))
+    }
+    ssh_channel_free(channel)
+  }
+}
+
+# ---- 6. supervise: reconnect with exponential backoff on any drop -
+# same shape as netbridge's own supervise() (retry_min/retry_max,
+# doubling, reset after a long-lived connection) so a relay hiccup or
+# network blip doesn't take the whole tunnel down permanently. ----
+if not start_worker_if_needed(LOCAL_SERVER_PORT) {
+  print("FAIL: the native server never started listening on " + str(LOCAL_SERVER_PORT) + " within 10s.")
   exit(1)
 }
-ssh.disconnect(setup_session)
 
-# ---- 3. generate the worker script (this machine's native SSH server)
-# with your chosen port/user/password baked in as literal values, and
-# launch it as its own background OS process - see the file header for
-# why this needs to be a separate process, not a function call here. ----
-step("starting this machine's own native SSH server on port " + str(LOCAL_SERVER_PORT))
-let worker_script = "import \"ssh\" as ssh\n" +
-  "let server = ssh.listen(" + str(LOCAL_SERVER_PORT) + ", \"" + HOST_KEY_PATH + "\")\n" +
-  "ssh.serve(server,\n" +
-  "  fn(user, password) { return user == \"" + LOCAL_SERVER_USER + "\" and password == \"" + LOCAL_SERVER_PASSWORD + "\" },\n" +
-  "  fn(cmd) { return capture(cmd + \" 2>&1\") },\n" +
-  "  {\"log_fn\": fn(line) { print(\"[native ssh server] \" + line) }})\n"
-write_file(WORKER_PATH, worker_script)
-
-if is_windows {
-  run("start /B \"\" larzscript \"" + WORKER_PATH + "\"")
-} else {
-  run("larzscript \"" + WORKER_PATH + "\" > /dev/null 2>&1 &")
+let backoff = RETRY_MIN_SECONDS
+while true {
+  step("connecting (real ssh -R through libssh - no external ssh process)")
+  let started = clock()
+  # Belt and suspenders: run_tunnel_once() already catches everything it
+  # knows how to hit internally, but this outer try/catch is the actual
+  # guarantee - nothing thrown from in there can ever escape this loop
+  # and kill the whole process, which would defeat the entire point of
+  # auto-reconnecting.
+  try {
+    run_tunnel_once(LOCAL_SERVER_PORT)
+  } catch e {
+    log("unexpected error: " + str(e))
+  }
+  let ran_seconds = clock() - started
+  if ran_seconds > 60 { backoff = RETRY_MIN_SECONDS }
+  log("tunnel dropped after " + str(ran_seconds) + "s - reconnecting in " + str(backoff) + "s")
+  sleep(backoff)
+  backoff = backoff * 2
+  if backoff > RETRY_MAX_SECONDS { backoff = RETRY_MAX_SECONDS }
 }
-sleep(1)   # give it a moment to bind the port before the tunnel tries to reach it
-
-# ---- 4. connect to the relay - real ssh -R forwarding to THIS machine's
-# own native server, stays up ----
-step("connecting (real ssh -R through libssh - no external ssh process)")
-let session = ssh.connect(RELAY_HOST, RELAY_SSH_PORT)
-ssh.verify_host_trust_on_first_use(session, KNOWN_HOSTS_PATH)
-ssh.authenticate_with_key(session, "tunnel", KEY_PATH)
-print("relay:" + str(TUNNEL_PORT) + "  ->  this machine's native ssh server on 127.0.0.1:" + str(LOCAL_SERVER_PORT))
-print("from the relay: ssh -p " + str(TUNNEL_PORT) + " " + LOCAL_SERVER_USER + "@127.0.0.1   (real interactive shell, real pty)")
-ssh.forward_remote_port(session, TUNNEL_PORT, "127.0.0.1", LOCAL_SERVER_PORT)

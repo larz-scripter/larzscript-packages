@@ -19,7 +19,12 @@
 #   print(result["stdout"])
 #   ssh.disconnect(session)
 
-fn connect(host, port) { return ssh_open(host, port) }
+# timeout_seconds: how long to wait for the TCP connect + SSH banner/key
+# exchange before giving up (default 15s) - fails fast on an unreachable
+# or silently-firewalled relay instead of hanging on libssh's own,
+# usually much longer, internal default. Found wanting during a real
+# live test against a relay that occasionally stopped responding.
+fn connect(host, port, timeout_seconds=15) { return ssh_open(host, port, timeout_seconds) }
 
 fn authenticate_with_password(session, user, password) { ssh_auth_password(session, user, password) }
 
