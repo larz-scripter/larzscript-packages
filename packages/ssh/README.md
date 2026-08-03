@@ -64,26 +64,35 @@ hardware-adjacent crypto here).
 
 ## Platform status - read this before relying on it anywhere
 
-**Linux x86_64 and macOS (x86_64 + arm64)** - client AND server role, both
-verified live. Every function throws a plain, catchable `SshError` ("real
-SSH is not available in this build") on every other platform right now -
-Windows, Linux aarch64, and the web/wasm build (the last one permanently,
-by the same sandbox-has-no-raw-TCP reasoning as the `tcp`/`socket_*`
-builtins). Being brought up platform by platform - Windows is next, and the
-hardest (no libssh package for the mingw cross-compile toolchain this
-project's Windows build uses - needs building libssh from source in CI).
+**Linux x86_64, macOS (x86_64 + arm64), and Windows x86_64** - client AND
+server role, all three verified live. Every function throws a plain,
+catchable `SshError` ("real SSH is not available in this build") on every
+other platform right now - Linux aarch64 and the web/wasm build (the
+latter permanently, by the same sandbox-has-no-raw-TCP reasoning as the
+`tcp`/`socket_*` builtins). Linux aarch64 is next.
 
-Release binaries on both platforms are fully static where that's the
-platform's own convention - Linux verified via `ldd` ("not a dynamic
-executable"); macOS binaries are dynamic-against-libSystem by Apple's own
+Windows was the hardest of the three: no mingw-w64 libssh package in
+Ubuntu's apt repos, so CI fetches MSYS2's prebuilt `libssh.a` directly and
+links it with Ubuntu's mingw-w64 cross-compiler - a real toolchain-version
+mismatch (MSYS2's own, newer mingw-w64-crt vs. Ubuntu's older bundled one)
+surfaced a handful of missing symbols (`memset_explicit`, `strndup`,
+`isblank`, `fstat64i32`, `if_nametoindex`) that needed real compat shims,
+not stubs of SSH behavior itself - see `native/mingw_compat_stub.c` in the
+`larzscript` repo for exactly what and why.
+
+Release binaries are fully static where that's the platform's own
+convention - Linux and Windows both verified (`ldd`'s "not a dynamic
+executable" on Linux; the Windows build links `-static` against the
+mingw-w64 runtime and MSYS2's static `libssh.a`/`libssl.a`/`libcrypto.a`/
+`libz.a`); macOS binaries are dynamic-against-libSystem by Apple's own
 convention (same as every other platform's macOS binary here) but libssh
-itself is statically linked from Homebrew's static `libssh.a`. Neither
-statically links Kerberos/GSSAPI - neither Ubuntu nor Homebrew ships a
-static Kerberos library - a small stub instead provides those
-referenced-but-unused symbols with real RFC 2744 "facility unavailable"
-responses, since this project never authenticates via GSSAPI. See
-`native/gssapi_stub.c` and `THIRD_PARTY_LICENSES.md` in the `larzscript`
-repo.
+itself is statically linked from Homebrew's static `libssh.a`. None
+statically link Kerberos/GSSAPI - neither Ubuntu, Homebrew, nor MSYS2
+ships a static Kerberos library for this - a small stub instead provides
+those referenced-but-unused symbols with real RFC 2744 "facility
+unavailable" responses, since this project never authenticates via
+GSSAPI. See `native/gssapi_stub.c` and `THIRD_PARTY_LICENSES.md` in the
+`larzscript` repo.
 
 `forward_remote_port()` currently supports one active forwarded connection
 at a time (matches the `tcp` package's own "not concurrent" precedent) -
@@ -106,7 +115,10 @@ password auth only - no server-side pubkey checking yet.
 
 All tested for real in CI against a live local `sshd`/real `ssh` client
 (real `openssh-server` or macOS's built-in `sshd`, key-based or password
-auth, throwaway keys), not stubs, on both Linux x86_64 and macOS:
+auth, throwaway keys), not stubs, on Linux x86_64, macOS, and Windows
+(the Windows binary run under Wine, whose winsock maps straight through
+to the runner's real network stack, talking to the same real Ubuntu
+`sshd`/`ssh` the Linux job uses):
 
 - `ssh.run()`: `echo hello-from-real-sshd && whoami`, asserted against the
   actual returned `stdout` and `exit_status` (both correct).

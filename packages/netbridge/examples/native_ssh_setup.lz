@@ -1,20 +1,26 @@
-# native_ssh_setup.lz - the same "one script, one password" flow as
-# password_setup.lz, but using the `ssh` package (real SSH via libssh,
-# bound into the interpreter itself) for EVERYTHING - the one-time
+# native_ssh_setup.lz - ONE script, same file, for Linux, macOS, AND
+# Windows - fill in 6 lines, run it, done, on whichever of the three
+# you're on. Uses the `ssh` package (real SSH via libssh, bound into
+# the interpreter itself) for EVERYTHING - the one-time
 # password-authenticated relay setup AND the tunnel connection both go
-# through ssh.connect()/ssh.run()/ssh.forward_remote_port(). No shelling
-# out to the `ssh` binary, no `sshpass` dependency - nothing external at
-# all, just `larzscript` and two Stack packages.
+# through ssh.connect()/ssh.run()/ssh.forward_remote_port(). No
+# shelling out to the `ssh` binary, no `sshpass` dependency, no WSL, no
+# per-OS variant to maintain - nothing external at all beyond
+# `larzscript` and two Stack packages, on any of the three.
 #
 # Needs the `ssh` package's native libssh binding, which - as of this
-# writing - is Linux x86_64 only (see `ssh`'s own README for current
-# platform status; every other platform throws a clear SshError). If
-# you're not on that platform yet, use password_setup.lz instead (shells
-# to the real `ssh`/`sshpass` binaries, works everywhere those do).
+# writing - covers exactly those three: Linux x86_64, macOS (x86_64 +
+# arm64), and Windows x86_64, all CI-verified against a real independent
+# sshd/ssh client (see `ssh`'s own README for exact platform status;
+# every other platform throws a clear SshError). Not on one of those
+# three yet (Linux aarch64, wasm)? Use password_setup.lz instead
+# (shells to the real `ssh`/`sshpass` binaries, works everywhere those
+# do, just needs those installed).
 #
 #   larzscript pkg install netbridge
 #   larzscript pkg install ssh
 #   nohup larzscript native_ssh_setup.lz > ~/netbridge.log 2>&1 &
+#   (on Windows: just `larzscript native_ssh_setup.lz`, no nohup/&)
 
 import "ssh" as ssh
 
@@ -25,17 +31,27 @@ let RELAY_ROOT_USER = "root"
 let RELAY_ROOT_PASSWORD = "change-me"     # only used once, for setup
 let TUNNEL_PORT = 2200                    # the port on the relay that will reach this machine
 let TARGET_HOST = "127.0.0.1"             # the local service to expose...
-let TARGET_PORT = 22                      # ...and its port
+let TARGET_PORT = 22                      # ...and its port (e.g. 3389 for Windows RDP)
 # ------------------------
 
-let KEY_PATH = env("HOME", ".") + "/.ssh/netbridge_key"
+# HOME isn't set by default in plain cmd/PowerShell - USERPROFILE is
+# Windows' equivalent. Forward slashes work fine in paths passed to
+# larzscript's own file/ssh-keygen calls on all three platforms.
+let KEY_PATH = env("HOME", env("USERPROFILE", ".")) + "/.ssh/netbridge_key"
 
 fn step(msg) { print("==> " + msg) }
 
 # ---- 1. client key - generated fresh here, unique per machine ----
+# Double-quoted path + double-quoted empty passphrase (-N "") rather
+# than single quotes: `run()` shells out via the OS's own shell
+# (/bin/sh on Linux/macOS, cmd.exe on Windows) - single-quote emptiness
+# is a POSIX-only convention (cmd.exe treats '' as two literal
+# characters, not nothing), but "" for an empty argument, and double
+# quotes around a path that might contain spaces, both work identically
+# on all three - the one quoting style that needed no per-OS branch.
 step("client key")
 if not file_exists(KEY_PATH) {
-  run("ssh-keygen -t ed25519 -f " + KEY_PATH + " -N '' -C netbridge-client -q")
+  run("ssh-keygen -t ed25519 -f \"" + KEY_PATH + "\" -N \"\" -C netbridge-client -q")
   print("generated " + KEY_PATH)
 } else {
   print("already have " + KEY_PATH)

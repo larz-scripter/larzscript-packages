@@ -24,32 +24,43 @@ forward - one tunnel reaches your whole reachable network).
 error markers (`ssh -N` is silent on success, so there's no exit code to
 wait on), and reconnects with exponential backoff.
 
-## One script, one password, done
+## One script, one password, done - same file on Linux, macOS, or Windows
 
-[`examples/password_setup.lz`](examples/password_setup.lz) - the
-fastest path if you just have a fresh relay and its root password. Fill
-in 4 lines at the top (host, port, root password), run it: generates its
-own client key, uses the password **once** to create a locked-down
-`tunnel` user on the relay (no shell, no X11/agent forwarding - real
-setup, not a stub), then connects and stays connected with real
-auto-reconnect (`netbridge.supervise()`, not a one-shot attempt that
-dies on the first hiccup). The password is never needed again after
-that one run - every reconnect after uses the key it generated.
+[`examples/native_ssh_setup.lz`](examples/native_ssh_setup.lz) - the one
+script to reach for, on any of the three. Fill in 6 lines at the top
+(relay host/port, root password, the port/service to expose), run it:
+generates its own client key, uses the password **once** to create a
+locked-down `tunnel` user on the relay (no shell, no X11/agent
+forwarding - real setup, not a stub), then connects and stays connected
+with real reverse-forwarding (`ssh.forward_remote_port()`, real SSH
+channel forwarding via libssh - the actual `ssh -R` under the hood). The
+password is never needed again after that one run - every reconnect
+after uses the key it generated.
+
+Uses the [`ssh`](https://github.com/larz-scripter/larzscript-packages/tree/master/packages/ssh)
+package (real SSH via libssh, bound into the interpreter itself) for
+everything - `ssh.connect()`/`ssh.run()` for the one-time relay setup,
+`ssh.forward_remote_port()` for the tunnel. Nothing external runs at any
+point on any platform - no `ssh` binary, no `sshpass`, no WSL:
 
 ```
 larzscript pkg install netbridge
-nohup larzscript password_setup.lz > ~/netbridge.log 2>&1 &
+larzscript pkg install ssh
+nohup larzscript native_ssh_setup.lz > ~/netbridge.log 2>&1 &
 ```
 
-Needs [`sshpass`](https://linux.die.net/man/1/sshpass) for the one-time
-password step (`apt install sshpass`) - the only extra dependency, and
-only for that one line.
+(on Windows: just `larzscript native_ssh_setup.lz` - no `nohup`/`&`.)
 
-Verified from a completely clean slate against a real VPS - no key, no
-`tunnel` user, nothing - three separate times before publishing this,
-each one ending with a real SSH banner confirmed back through the
-tunnel (not a stub, and not the same banner every time - dropbear,
-because that's what the real machine tunneled to was actually running):
+Needs the `ssh` package's native libssh binding, which as of this
+writing covers exactly Linux x86_64, macOS (x86_64 + arm64), and Windows
+x86_64 - all three CI-verified end to end against a real independent
+`sshd`/`ssh` client (see `ssh`'s own README for exact status). Not on
+one of those three yet (Linux aarch64, wasm)? Use
+[`examples/password_setup.lz`](examples/password_setup.lz) instead -
+same 4-field flow, shells out to the real `ssh`/`sshpass` binaries
+instead, works wherever those are installed (`apt install sshpass`),
+verified from a completely clean slate against a real VPS three separate
+times before publishing:
 
 ```
 ==> client key
@@ -63,37 +74,15 @@ relay:2200  ->  127.0.0.1:22
 (from the relay: `ssh -p 2200 you@127.0.0.1` now lands on the client
 machine's real `sshd`.)
 
-### Zero external processes at all (no `ssh`, no `sshpass`)
-
-[`examples/native_ssh_setup.lz`](examples/native_ssh_setup.lz) - the same
-flow again, but using the [`ssh`](https://github.com/larz-scripter/larzscript-packages/tree/master/packages/ssh)
-package instead of shelling out: `ssh.connect()`/`ssh.run()` for the
-one-time password-authenticated relay setup, `ssh.forward_remote_port()`
-(real SSH channel forwarding via libssh, the actual `ssh -R` under the
-hood) for the tunnel itself. Nothing external runs at any point - not
-even the `ssh` binary. Needs the `ssh` package's native libssh binding,
-which is **Linux x86_64 only as of this writing** (every other platform
-throws a clear `SshError` - check `ssh`'s own README for current status).
-Not yet end-to-end verified against a live relay the way the script above
-was (its underlying `ssh.run()`/`ssh.forward_remote_port()` calls have
-been, in CI - see the `ssh` package - but this specific script's own
-orchestration hasn't had its own dedicated run yet).
-
-### On Windows
-
-[`examples/password_setup_windows.lz`](examples/password_setup_windows.lz) -
-same script, same 4 fields, but targets Windows' own built-in OpenSSH
-Server instead of a Linux `sshd`. Installs/starts the Windows OpenSSH
-Server feature if it isn't already running (needs one Administrator run
-for that), then generates a key and connects exactly like the Linux
-version. For the one-time password step it borrows WSL's `sshpass` if
-WSL is installed on the machine (same trusted setup script, just reached
-through WSL as a transport - `sshd` and the tunnel itself stay 100%
-native Windows); without WSL it prints the setup script for you to run
-by hand, once. Point of a native-Windows target at all: WSL's `sshd`
-sits behind its own virtual network adapter, which is the actual cause
-if a tunnel connects but times out on the far side - native Windows
-doesn't have that problem.
+[`examples/password_setup_windows.lz`](examples/password_setup_windows.lz)
+also still exists for the one Windows-specific case `native_ssh_setup.lz`
+doesn't cover: exposing Windows' own **OpenSSH Server** feature
+specifically (installs/starts it if missing) rather than an arbitrary
+local port - `native_ssh_setup.lz`'s `TARGET_PORT` can already point at
+anything reachable on 127.0.0.1 (22 if you have Windows OpenSSH Server
+running, 3389 for RDP, etc.), so reach for the Windows-specific script
+only if you also want this script to install that Windows feature for
+you.
 
 ## Setting up a real relay by hand, with your own SSH key
 
