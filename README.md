@@ -170,6 +170,7 @@ Larzscript, one per Larz Stack library slot (`larzcart` -> `cart`, etc.):
 | [units](packages/units) | unit conversion + dimensional checks |
 | [netbridge](packages/netbridge) | reverse SSH tunnels through a relay, no inbound port needed |
 | [psktunnel](packages/psktunnel) | remote exec + TCP forwarding through a relay, pure Larzscript - not SSH, no external deps |
+| [ssh](packages/ssh) | real SSH via libssh bound into the interpreter - Linux x86_64 client only so far |
 | [neural](packages/neural) | reverse-mode autodiff + a tiny trainable neural net, from scratch |
 | [raytrace](packages/raytrace) | a real ray tracer, rendered to a real PPM image |
 | [crdt](packages/crdt) | conflict-free replicated data types (G-Counter, OR-Set, ...) |

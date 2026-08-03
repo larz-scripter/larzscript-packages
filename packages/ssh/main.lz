@@ -1,0 +1,34 @@
+# ssh - real SSH, via libssh bound into the native interpreter (not a
+# from-scratch reimplementation - real SSH key exchange needs big-integer/
+# elliptic-curve math Larzscript's double-only numeric type can't honestly
+# do, the same reason `crypto` doesn't implement X25519/Ed25519). This
+# talks to real sshd/OpenSSH/dropbear, no shelling out to the `ssh` binary.
+#
+# Phase 1: client only, and only where libssh is actually linked (see this
+# package's README for exactly which platforms - NOT all of them yet).
+# Where it isn't linked, every function below throws a clear SshError
+# instead of "unknown identifier" - check for that if you're unsure your
+# platform is covered yet.
+#
+#   larzscript pkg install ssh
+#
+#   import "ssh" as ssh
+#   let session = ssh.connect("myserver.com", 22)
+#   ssh.authenticate_with_password(session, "root", "hunter2")
+#   let result = ssh.run(session, "whoami")
+#   print(result["stdout"])
+#   ssh.disconnect(session)
+
+fn connect(host, port) { return ssh_open(host, port) }
+
+fn authenticate_with_password(session, user, password) { ssh_auth_password(session, user, password) }
+
+fn authenticate_with_key(session, user, key_path) { ssh_auth_key(session, user, key_path) }
+
+# Runs `cmd` on the remote host and waits for it to finish. Returns
+# {"stdout": ..., "stderr": ..., "exit_status": ...} - the command's real
+# output and real exit code, not just whether the SSH request itself
+# succeeded.
+fn run(session, cmd) { return ssh_run(session, cmd) }
+
+fn disconnect(session) { ssh_close(session) }
