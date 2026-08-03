@@ -19,6 +19,21 @@ print(result["exit_status"])  # real exit code
 ssh.disconnect(session)
 ```
 
+The actual `ssh -R` equivalent - what would replace `netbridge`'s
+reverse-tunnel use case, exposing a service through a relay with no inbound
+port needed on the exposed machine:
+
+```
+import "ssh" as ssh
+
+let session = ssh.connect("your-relay.example.com", 22)
+ssh.authenticate_with_key(session, "you", "~/.ssh/id_ed25519")
+
+# anyone connecting to the relay's port 2200 gets bridged to this
+# machine's own sshd - blocks forever, real auto-serving
+ssh.forward_remote_port(session, 2200, "127.0.0.1", 22)
+```
+
 ## Why libssh, not a pure-Larzscript implementation
 
 Real SSH key exchange needs big-integer/elliptic-curve math. Larzscript's
@@ -46,32 +61,40 @@ by platform, hardest first-to-solve is Windows (no libssh package for the
 mingw cross-compile toolchain this project's Windows build uses - needs
 building libssh from source in CI, not yet done).
 
-The Linux x86_64 build also isn't fully static like every other platform's
-release binary - Ubuntu's `libssh-dev` only ships a shared library, so this
-platform's binary currently depends on libssh (and its crypto backend)
-being installed on the host. Revisiting this (a real static libssh) is
-part of the Windows work, since a single self-contained binary matters
-most there.
+The Linux x86_64 release binary IS fully static (verified via `ldd` in CI -
+"not a dynamic executable") - Ubuntu's `libssh-dev` ships a real static
+`libssh.a` alongside its shared library, so no runtime dependency on
+libssh, OpenSSL, or anything else is introduced. (It doesn't statically
+link Kerberos/GSSAPI - Ubuntu ships no static Kerberos library at all - a
+small stub instead provides those referenced-but-unused symbols with real
+RFC 2744 "facility unavailable" responses, since this project never
+authenticates via GSSAPI. See `native/gssapi_stub.c` and
+`THIRD_PARTY_LICENSES.md` in the `larzscript` repo.)
+
+`forward_remote_port()` currently supports one active forwarded connection
+at a time (matches the `tcp` package's own "not concurrent" precedent) -
+a second incoming connection waits until the first closes.
 
 ## Not yet implemented
 
 - **Server role** (`ssh.listen()`/accepting inbound connections) - libssh
   supports this, not wired up yet.
-- **Remote port forwarding** (the actual `ssh -R` equivalent, what would
-  replace `netbridge`'s reverse-tunnel use case) - libssh's channel API
-  isn't a POSIX file descriptor, so it needs its own bridging loop rather
-  than reusing this project's existing `socket_poll()` directly. Real,
-  scoped follow-up work, not forgotten.
 - **Host key verification** - connections aren't checked against a known-
   hosts file yet. Stated plainly: this is a real security gap for this
   phase, not silently glossed over.
+- **Concurrent forwarded connections** - `forward_remote_port()` is one at
+  a time for now, see above.
 
 ## Verified
 
-`ssh.run()` tested for real in CI against a live local `sshd` (real
-`openssh-server`, key-based auth, a throwaway keypair) - connect,
-authenticate, and `echo hello-from-real-sshd && whoami`, asserted against
-the actual returned `stdout` and `exit_status` (both correct), not just a
-clean process exit. See `.github/workflows/native.yml`'s "Verify ssh.run()
-against a real local sshd" step in the `larzscript` repo for the exact
-test that ran.
+Both tested for real in CI against a live local `sshd` (real
+`openssh-server`, key-based auth, a throwaway keypair), not stubs:
+
+- `ssh.run()`: `echo hello-from-real-sshd && whoami`, asserted against the
+  actual returned `stdout` and `exit_status` (both correct).
+- `ssh.forward_remote_port()`: a real local TCP echo service, forwarded
+  through the same sshd's remote port, reached by an external client - the
+  real banner and a real echoed payload both round-tripped correctly.
+
+See `.github/workflows/native.yml`'s two "Verify ssh..." steps in the
+`larzscript` repo for the exact tests that ran.

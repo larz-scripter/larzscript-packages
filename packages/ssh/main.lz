@@ -19,6 +19,8 @@
 #   print(result["stdout"])
 #   ssh.disconnect(session)
 
+import "tcp" as tcp
+
 fn connect(host, port) { return ssh_open(host, port) }
 
 fn authenticate_with_password(session, user, password) { ssh_auth_password(session, user, password) }
@@ -32,3 +34,46 @@ fn authenticate_with_key(session, user, key_path) { ssh_auth_key(session, user, 
 fn run(session, cmd) { return ssh_run(session, cmd) }
 
 fn disconnect(session) { ssh_close(session) }
+
+# The real `ssh -R` equivalent: asks the connected server to listen on
+# `remote_port` and forward every connection it gets there back to
+# `target_host:target_port` on THIS machine - no custom protocol, this is
+# real SSH channel forwarding through a real sshd, exactly what netbridge
+# achieves by shelling out to `ssh -R`.
+#
+# Blocks forever. One active forwarded connection at a time (matches the
+# `tcp` package's own "not concurrent" precedent) - a second incoming
+# connection waits until the first one closes.
+#
+# Known limit, stated plainly: forwarded data passes through Larzscript
+# string values, which are NUL-terminated C strings under the hood (see
+# psktunnel's README for the full explanation) - a real `0x00` byte in the
+# forwarded traffic will be silently truncated. Fine for text-oriented
+# protocols; not verified safe for arbitrary binary protocols.
+fn forward_remote_port(session, remote_port, target_host, target_port, opts={}) {
+  let log = opts.has("log_fn") ? opts["log_fn"] : fn(line) { print(line) }
+  ssh_listen_forward(session, remote_port)
+  log("ssh: listening on the relay's port " + str(remote_port) + " -> " + target_host + ":" + str(target_port))
+  while true {
+    let channel = ssh_accept_forward(session, 1000)
+    if channel == nil { continue }
+    log("ssh: forwarded connection accepted, bridging")
+    let local_fd = socket_connect(target_host, target_port)
+    while true {
+      let avail = ssh_channel_poll(channel, 100)
+      if avail > 0 {
+        tcp.write_all(local_fd, ssh_channel_read(channel, avail))
+      }
+      if ssh_channel_eof(channel) { break }
+      let ready = socket_poll([local_fd], 100)
+      if ready.contains(local_fd) {
+        let data = socket_read(local_fd, 16384)
+        if data == "" { break }
+        ssh_channel_write(channel, data)
+      }
+    }
+    socket_close(local_fd)
+    ssh_channel_free(channel)
+    log("ssh: forwarded connection closed")
+  }
+}
