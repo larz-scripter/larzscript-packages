@@ -11,6 +11,27 @@
 #   wav.write("tone.wav", samples, 22050)          # mono, 16-bit
 #   let w = wav.read("tone.wav")
 #   print(w["sample_rate"], w["channels"], len(w["samples"]))
+#
+# write()/read() above hold the whole file's samples in one List - fine
+# for short clips, but a multi-minute recording as one List of boxed
+# Values is heavy on RAM. open_write()/write_chunk()/close_write() and
+# open_read()/read_chunk()/eof() below process a file in fixed-size
+# chunks instead, so peak memory stays bounded by chunk size regardless
+# of the file's total length:
+#
+#   let w = wav.open_write("out.wav", 22050)
+#   while <more samples to produce> { wav.write_chunk(w, next_chunk) }
+#   wav.close_write(w)
+#
+#   let r = wav.open_read("out.wav")
+#   while not wav.eof(r) {
+#     let chunk = wav.read_chunk(r, 22050)   # up to 1s of samples at a time
+#     <process chunk>
+#   }
+#
+# Both sides are dicts used as mutable state (matching `dsp`'s
+# filter/compressor objects) - pass the same one back into each call,
+# nothing is returned to reassign.
 
 fn _u16le(n) { return [n % 256, (n // 256) % 256] }
 fn _u32le(n) { return [n % 256, (n // 256) % 256, (n // 65536) % 256, (n // 16777216) % 256] }
@@ -27,23 +48,13 @@ fn _read_str(bytes_, i, n) {
   return s
 }
 
-# samples: floats in [-1, 1] (clamped). channels: 1 (mono) or 2 (stereo,
-# pre-interleaved by the caller). Always 16-bit PCM.
-fn write(path, samples, sample_rate, channels=1) {
-  let pcm = []
-  for s in samples {
-    let v = s
-    if v > 1.0 { v = 1.0 }
-    if v < -1.0 { v = -1.0 }
-    let n = int(v * 32767)
-    if n < 0 { n = 65536 + n }
-    let b = _u16le(n)
-    pcm.push(b[0]); pcm.push(b[1])
-  }
-
+# Always 44 bytes for 16-bit PCM (one "fmt " chunk, no extension). data_size
+# may be a placeholder (0) when the real size isn't known yet - the size
+# fields (offsets 4 and 40) are the only ones close_write() ever has to
+# patch afterward.
+fn _header_bytes(sample_rate, channels, data_size) {
   let byte_rate = sample_rate * channels * 2
   let block_align = channels * 2
-  let data_size = len(pcm)
 
   let header = _str_bytes("RIFF")
   header = header + _u32le(36 + data_size)
@@ -58,9 +69,49 @@ fn write(path, samples, sample_rate, channels=1) {
   header = header + _u16le(16)             # bits per sample
   header = header + _str_bytes("data")
   header = header + _u32le(data_size)
+  return header
+}
 
+# Native accelerator (clamp + scale + byte-split, no Larzscript-level
+# object allocation per sample) - a pure-Larzscript per-sample loop here
+# was the single biggest remaining cost in the streaming write path once
+# the dsp filter/compressor chain itself was made native too (each sample
+# built a fresh 2-item List via _u16le() otherwise).
+fn _samples_to_pcm(samples) {
+  return _native_pcm16_encode(samples)
+}
+
+# samples: floats in [-1, 1] (clamped). channels: 1 (mono) or 2 (stereo,
+# pre-interleaved by the caller). Always 16-bit PCM. Holds the whole file
+# in memory - fine for short clips; see open_write() below for long ones.
+fn write(path, samples, sample_rate, channels=1) {
+  let pcm = _samples_to_pcm(samples)
+  let header = _header_bytes(sample_rate, channels, len(pcm))
   write_file(path, header + pcm)
   return len(header) + len(pcm)
+}
+
+# Streaming write: call once to open, write_chunk() as many times as you
+# like with however many samples you have on hand, close_write() once at
+# the end. Peak memory is bounded by the largest single chunk you pass in,
+# never by the file's total length - a placeholder-size header is written
+# immediately and patched with the real size at close, via
+# patch_file_bytes() (a few bytes touched in place, not a full rewrite).
+fn open_write(path, sample_rate, channels=1) {
+  write_file(path, _header_bytes(sample_rate, channels, 0))
+  return {"path": path, "sample_rate": sample_rate, "channels": channels, "data_size": 0}
+}
+
+fn write_chunk(w, samples) {
+  let pcm = _samples_to_pcm(samples)
+  if len(pcm) > 0 { append_file(w["path"], pcm) }
+  w["data_size"] = w["data_size"] + len(pcm)
+}
+
+fn close_write(w) {
+  let data_size = w["data_size"]
+  patch_file_bytes(w["path"], 4, _u32le(36 + data_size))    # RIFF chunk size
+  patch_file_bytes(w["path"], 40, _u32le(data_size))        # data chunk size
 }
 
 # Scans real RIFF chunks (doesn't assume a fixed header layout - files
@@ -97,15 +148,71 @@ fn read(path) {
     throw {"type": "LarzValueError", "message": "wav.read() only supports 16-bit PCM, got " + str(bits_per_sample) + "-bit"}
   }
 
-  let samples = []
-  let i = data_start
-  let end = data_start + data_size
-  while i + 1 < end {
-    let n = _read_u16le(b, i)
-    if n >= 32768 { n = n - 65536 }
-    samples.push(n / 32768.0)
-    i = i + 2
-  }
+  let end_aligned = data_start + (data_size - (data_size % 2))
+  let samples = _native_pcm16_decode(b[data_start:end_aligned])
 
   return {"sample_rate": sample_rate, "channels": channels, "samples": samples}
 }
+
+# Streaming read: open_read() scans real RIFF chunks the same way read()
+# does, but only ever pulls a few bytes at a time (chunk headers, the
+# small "fmt " body) via read_file_bytes_range() - it never reads the
+# (potentially huge) "data" chunk's body during the scan. read_chunk()
+# then pulls up to max_samples samples per call; call it in a loop until
+# eof(r) to walk the whole file with memory bounded by max_samples, not
+# by the file's total length.
+fn open_read(path) {
+  let head = read_file_bytes_range(path, 0, 12)
+  if len(head) < 12 or _read_str(head, 0, 4) != "RIFF" or _read_str(head, 8, 4) != "WAVE" {
+    throw {"type": "LarzValueError", "message": path + " is not a valid RIFF/WAVE file"}
+  }
+  let total = file_size(path)
+  let sample_rate = 0
+  let channels = 1
+  let bits_per_sample = 16
+  let data_start = -1
+  let data_size = 0
+
+  let pos = 12
+  while pos + 8 <= total and data_start < 0 {
+    let ch = read_file_bytes_range(path, pos, 8)
+    let chunk_id = _read_str(ch, 0, 4)
+    let chunk_size = _read_u32le(ch, 4)
+    let body = pos + 8
+    if chunk_id == "fmt " {
+      let fmt_body = read_file_bytes_range(path, body, chunk_size)
+      channels = _read_u16le(fmt_body, 2)
+      sample_rate = _read_u32le(fmt_body, 4)
+      bits_per_sample = _read_u16le(fmt_body, 14)
+    } else if chunk_id == "data" {
+      data_start = body
+      data_size = chunk_size
+    }
+    pos = body + chunk_size + (chunk_size % 2)   # chunks are word-aligned
+  }
+
+  if data_start < 0 { throw {"type": "LarzValueError", "message": path + " has no data chunk"} }
+  if bits_per_sample != 16 {
+    throw {"type": "LarzValueError", "message": "wav streaming read only supports 16-bit PCM, got " + str(bits_per_sample) + "-bit"}
+  }
+
+  return {"path": path, "sample_rate": sample_rate, "channels": channels,
+          "data_start": data_start, "data_size": data_size, "pos": data_start}
+}
+
+fn read_chunk(r, max_samples) {
+  let end = r["data_start"] + r["data_size"]
+  let remaining = end - r["pos"]
+  if remaining <= 0 { return [] }
+  let want = max_samples * 2
+  if want > remaining { want = remaining }
+  want = want - (want % 2)   # stay sample-aligned (2 bytes/sample, 16-bit)
+  if want <= 0 { return [] }
+
+  let b = read_file_bytes_range(r["path"], r["pos"], want)
+  let samples = _native_pcm16_decode(b)
+  r["pos"] = r["pos"] + len(b)
+  return samples
+}
+
+fn eof(r) { return r["pos"] >= r["data_start"] + r["data_size"] }

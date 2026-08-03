@@ -26,6 +26,7 @@ import "random" as rng
 let PI = 3.141592653589793
 let LN10 = 2.302585092994046
 let E = 2.718281828459045
+let LN2 = 0.6931471805599453
 
 # ---- sin/cos/exp/ln - none are builtins (see orbits' own ln() for the
 # same constraint). Range-reduced Taylor series; accurate to ~1e-6 over
@@ -50,15 +51,28 @@ fn _exp(y) {
 
 fn _ln(x) {
   if x <= 0 { throw {"type": "LarzValueError", "message": "ln() needs a positive number"} }
-  let lo = -50.0
-  let hi = 50.0
-  let i = 0
-  while i < 100 {
-    let mid = (lo + hi) / 2
-    if _exp(mid) < x { lo = mid } else { hi = mid }
-    i = i + 1
+  # Range-reduce to v in [1, 2) (tracking the power of 2 removed as k),
+  # then the fast-converging atanh series ln(v) = 2*atanh(z),
+  # z = (v-1)/(v+1) - z stays in [0, 1/3) here, so ~10 terms already hits
+  # double precision. (A prior version bisected against _exp() 100 times
+  # per call - fine in isolation, but catastrophic at LUT-build volume:
+  # compressor_new()'s 4096-entry table alone took ~55s. This is the same
+  # cost class as sqrt()'s Newton's-method loop below, not a special case.)
+  let k = 0
+  let v = x
+  while v >= 2.0 { v = v / 2.0; k = k + 1 }
+  while v < 1.0 { v = v * 2.0; k = k - 1 }
+  let z = (v - 1) / (v + 1)
+  let z2 = z * z
+  let term = z
+  let total = 0.0
+  let n = 1
+  while n <= 19 {
+    total = total + term / n
+    term = term * z2
+    n = n + 2
   }
-  return (lo + hi) / 2
+  return 2 * total + k * LN2
 }
 
 # `%` truncates both sides to integers first (Larzscript has no float
@@ -144,10 +158,18 @@ fn biquad_process(f, x) {
   return y
 }
 
+# A pure-Larzscript per-sample loop here costs tens of microseconds per
+# call at this interpreter's per-call overhead - fine for one-off use,
+# but multiplied over a real multi-minute master (several filters x
+# hundreds of thousands of samples) that's minutes of render time. The
+# interpreter exposes a native accelerator with the exact same math and
+# filter-dict contract as biquad_process() above (same RBJ difference
+# equation, same field names, mutates the same history fields) - this
+# just runs it as one tight C loop instead of one function call per
+# sample. biquad_process() itself is unchanged and still the right tool
+# for one sample at a time.
 fn biquad_process_buffer(f, buf) {
-  let out = []
-  for x in buf { out.push(biquad_process(f, x)) }
-  return out
+  return _native_biquad_process_buffer(f, buf)
 }
 
 # ---- compressor: threshold/ratio in dB, attack/release in ms. Builds a
@@ -201,39 +223,36 @@ fn compressor_process(c, x) {
   return x * gain
 }
 
+# Same rationale as biquad_process_buffer() above - native envelope
+# follower + LUT-gain loop, same compressor-dict contract. lut_size/
+# lut_max_linear are passed through explicitly so the native side can
+# never drift from the constants that actually built the LUT.
 fn compressor_process_buffer(c, buf) {
-  let out = []
-  for x in buf { out.push(compressor_process(c, x)) }
-  return out
+  return _native_compressor_process_buffer(c, buf, _LUT_SIZE, _LUT_MAX_LINEAR)
 }
 
 # ---- limiter: a true brickwall is just a linear clamp to the ceiling -
 # infinite ratio needs no log/LUT at all, unlike the compressor above. ----
 
+# limit/peak_dbfs/rms_dbfs/normalize_to below are one-op-per-sample
+# passes (a clamp, a max, a sum of squares, a scale) - nothing
+# algorithmically interesting, but several such passes over a whole
+# multi-minute track add up the same way the filter/compressor chain
+# above did, so the actual per-sample sweep runs natively; the dB<->linear
+# conversion and the resulting scalar (ceiling/peak/gain) stay here.
 fn limit(buf, ceiling_db) {
-  let ceiling = db_to_linear(ceiling_db)
-  let out = []
-  for x in buf {
-    if x > ceiling { out.push(ceiling) }
-    else if x < -ceiling { out.push(-ceiling) }
-    else { out.push(x) }
-  }
-  return out
+  return _native_limit_buffer(buf, db_to_linear(ceiling_db))
 }
 
 # ---- level metering + normalization ----
 
 fn peak_dbfs(buf) {
-  let peak = 0.0
-  for x in buf { let a = x < 0 ? -x : x; if a > peak { peak = a } }
-  return linear_to_db(peak)
+  return linear_to_db(_native_peak_abs(buf))
 }
 
 fn rms_dbfs(buf) {
   if len(buf) == 0 { return -120.0 }
-  let sum_sq = 0.0
-  for x in buf { sum_sq = sum_sq + x * x }
-  return linear_to_db(sqrt(sum_sq / len(buf)))
+  return linear_to_db(sqrt(_native_sum_sq(buf) / len(buf)))
 }
 
 fn normalize_to(buf, target_dbfs) {
@@ -241,9 +260,7 @@ fn normalize_to(buf, target_dbfs) {
   if peak <= 0 { return list(buf) }
   let target = db_to_linear(target_dbfs)
   let g = target / peak
-  let out = []
-  for x in buf { out.push(x * g) }
-  return out
+  return _native_scale_buffer(buf, g)
 }
 
 # ---- synthesis helpers ----
