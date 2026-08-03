@@ -58,21 +58,31 @@ fn forward_remote_port(session, remote_port, target_host, target_port, opts={}) 
     let channel = ssh_accept_forward(session, 1000)
     if channel == nil { continue }
     log("ssh: forwarded connection accepted, bridging")
-    let local_fd = socket_connect(target_host, target_port)
-    while true {
-      let avail = ssh_channel_poll(channel, 100)
-      if avail > 0 {
-        tcp.write_all(local_fd, ssh_channel_read(channel, avail))
+    # Wrapped: without this, any error during one connection's lifetime
+    # (the local target refusing a connection, a channel read/write
+    # error) propagated all the way out of this function and killed the
+    # WHOLE tunnel - not just that one connection - taking the real ssh
+    # session (and the relay's remote-forward listener with it) down.
+    # Found via a real live test against a real relay, not assumed.
+    try {
+      let local_fd = socket_connect(target_host, target_port)
+      while true {
+        let avail = ssh_channel_poll(channel, 100)
+        if avail > 0 {
+          tcp.write_all(local_fd, ssh_channel_read(channel, avail))
+        }
+        if ssh_channel_eof(channel) { break }
+        let ready = socket_poll([local_fd], 100)
+        if ready.contains(local_fd) {
+          let data = socket_read(local_fd, 16384)
+          if data == "" { break }
+          ssh_channel_write(channel, data)
+        }
       }
-      if ssh_channel_eof(channel) { break }
-      let ready = socket_poll([local_fd], 100)
-      if ready.contains(local_fd) {
-        let data = socket_read(local_fd, 16384)
-        if data == "" { break }
-        ssh_channel_write(channel, data)
-      }
+      socket_close(local_fd)
+    } catch e {
+      log("ssh: forwarded connection error: " + str(e))
     }
-    socket_close(local_fd)
     ssh_channel_free(channel)
     log("ssh: forwarded connection closed")
   }
