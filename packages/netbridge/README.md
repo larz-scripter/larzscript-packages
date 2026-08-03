@@ -63,6 +63,22 @@ relay:2200  ->  127.0.0.1:22
 (from the relay: `ssh -p 2200 you@127.0.0.1` now lands on the client
 machine's real `sshd`.)
 
+### Zero external processes at all (no `ssh`, no `sshpass`)
+
+[`examples/native_ssh_setup.lz`](examples/native_ssh_setup.lz) - the same
+flow again, but using the [`ssh`](https://github.com/larz-scripter/larzscript-packages/tree/master/packages/ssh)
+package instead of shelling out: `ssh.connect()`/`ssh.run()` for the
+one-time password-authenticated relay setup, `ssh.forward_remote_port()`
+(real SSH channel forwarding via libssh, the actual `ssh -R` under the
+hood) for the tunnel itself. Nothing external runs at any point - not
+even the `ssh` binary. Needs the `ssh` package's native libssh binding,
+which is **Linux x86_64 only as of this writing** (every other platform
+throws a clear `SshError` - check `ssh`'s own README for current status).
+Not yet end-to-end verified against a live relay the way the script above
+was (its underlying `ssh.run()`/`ssh.forward_remote_port()` calls have
+been, in CI - see the `ssh` package - but this specific script's own
+orchestration hasn't had its own dedicated run yet).
+
 ### On Windows
 
 [`examples/password_setup_windows.lz`](examples/password_setup_windows.lz) -
