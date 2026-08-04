@@ -110,7 +110,16 @@ fn forward_remote_port(session, remote_port, target_host, target_port, opts={}) 
   log("ssh: listening on the relay's port " + str(remote_port) + " -> " + target_host + ":" + str(target_port))
   while true {
     let channel = ssh_accept_forward(session, 1000)
-    if channel == nil { continue }
+    if channel == nil {
+      # ssh_accept_forward() returns nil both for "nothing arrived yet"
+      # and "the session died" (see its own C comment) - without this
+      # check a dead connection would spin here silently forever, never
+      # giving a caller's own reconnect-with-backoff logic a turn to run.
+      if not ssh_is_connected(session) {
+        throw {"type": "SshError", "message": "session disconnected"}
+      }
+      continue
+    }
     log("ssh: forwarded connection accepted, bridging")
     # Wrapped: without this, any error during one connection's lifetime
     # (the target refusing a connection, a socket/channel error)
@@ -339,7 +348,12 @@ fn forward_remote_socks(session, remote_port, opts={}) {
   log("ssh: SOCKS listening on the relay's port " + str(remote_port))
   while true {
     let channel = ssh_accept_forward(session, 1000)
-    if channel == nil { continue }
+    if channel == nil {
+      if not ssh_is_connected(session) {
+        throw {"type": "SshError", "message": "session disconnected"}
+      }
+      continue
+    }
     log("ssh: SOCKS connection accepted")
     try {
       _socks_handle_connection(channel, timeout_ms)
