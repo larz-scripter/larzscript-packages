@@ -1,7 +1,8 @@
-# netbridge - reverse SSH tunnels: expose a service on THIS machine
-# (behind NAT/CGNAT/a firewall) through a relay server you control,
-# without opening any inbound port here. Two tunnel kinds, both built
-# on plain `ssh -R` (no VPN, no extra daemon on the relay beyond sshd):
+# netbridge - reverse SSH tunnels + direct SFTP-style pull/push: expose a
+# service on THIS machine (behind NAT/CGNAT/a firewall) through a relay
+# server you control, without opening any inbound port here. Two tunnel
+# kinds, both built on real SSH channel forwarding (no VPN, no extra
+# daemon on the relay beyond sshd):
 #
 #   "forward" - classic reverse port-forward. relay:REMOTE_PORT becomes
 #               a door straight to LOCAL_HOST:LOCAL_PORT on this
@@ -10,38 +11,45 @@
 #               and land on a real shell here - the pattern this
 #               package is modeled on).
 #   "socks"   - reverse DYNAMIC forward (no destination). The relay
-#               gets a SOCKS5 listener; THIS machine's ssh client
-#               resolves each connection using its own routing table -
-#               one tunnel reaches your whole reachable network, not
-#               just one port.
+#               gets a real SOCKS4/4a/5 listener; THIS machine resolves
+#               each connection using its own network - one tunnel
+#               reaches your whole reachable network, not just one port.
 #
 # Ported from the design behind the real NetBridge Windows app (same
-# `-N -T -R ... -o ExitOnForwardFailure=yes` command shape, same
-# UP-detection-by-grace-period + known-error-marker scan, same
-# exponential-backoff reconnect). Larzscript has no OS threads, so
-# there's no internal supervisor thread the way the original has one
-# per tunnel - `supervise()` here blocks the calling process for as
-# long as the tunnel should stay up (run one `larzscript` process per
-# tunnel, backgrounded by your OS the same way the original backgrounds
-# one `ssh` child process per tunnel anyway). Needs a real `ssh` binary
-# on PATH - hosted-only, shells out, hasn't been tried against the
-# kernel's freestanding net stack.
+# UP-detection + exponential-backoff-reconnect shape). Built entirely on
+# the `ssh` package (real SSH via libssh bound into the interpreter
+# itself) - no external `ssh`/`scp`/`sshpass` binary anywhere, on any
+# platform `ssh` is linked on. (An earlier version of this package shelled
+# out to a real `ssh` binary via popen() - kept only as a historical note,
+# not a fallback; the `ssh` package's own README documents platform
+# coverage.) Larzscript has no OS threads, so there's no internal
+# supervisor thread the way the original has one per tunnel -
+# `supervise()` here blocks the calling process for as long as the
+# tunnel should stay up (run one `larzscript` process per tunnel,
+# backgrounded by your OS the same way the original backgrounds one
+# `ssh` child process per tunnel anyway).
 #
 #   import "netbridge" as netbridge
 #   let srv = netbridge.default_server()
 #   srv["host"] = "relay.example.com"
 #   srv["identity"] = "~/.ssh/netbridge_key"
 #   let t = netbridge.tunnel_forward("my-shell", 2200, "127.0.0.1", 22)
-#   print(netbridge.build_ssh_command(srv, t))
 #   netbridge.supervise(srv, t, {"log_fn": fn(name, line) { print(line) }})
+#
+# pull()/push() don't need a tunnel at all if this machine can already
+# reach the relay/server directly (most residential/office networks allow
+# *outbound* even when they can't accept *inbound* - that's the whole
+# reason tunnels exist in the first place):
+#
+#   netbridge.pull(srv, "/remote/backup.tar.gz", "backup.tar.gz")
 
 import "json" as json
+import "ssh" as ssh
 
 fn default_server() {
   return {
     "host": "", "port": 22, "user": "tunnel", "identity": "netbridge_key",
-    "alive_interval": 15, "alive_count_max": 3,
-    "retry_min": 5, "retry_max": 45, "ssh_exe": "ssh", "known_hosts": "known_hosts"
+    "alive_interval": 15, "retry_min": 5, "retry_max": 45, "known_hosts": "known_hosts"
   }
 }
 
@@ -59,20 +67,9 @@ fn tunnel_forward(name, remote_bind_port, local_host="localhost", local_port=22,
   return {"name": name, "kind": "forward", "remote_bind_port": remote_bind_port, "bind_address": bind_address, "local_host": local_host, "local_port": local_port, "autostart": autostart}
 }
 
-# The argument to ssh's -R for this tunnel.
-fn forward_spec(tunnel) {
-  let port = tunnel["remote_bind_port"]
-  let bind = tunnel.get("bind_address", "").strip()
-  if tunnel["kind"] == "socks" {
-    return len(bind) > 0 ? bind + ":" + str(port) : str(port)
-  }
-  let dest = tunnel.get("local_host", "localhost") + ":" + str(tunnel.get("local_port", 22))
-  return len(bind) > 0 ? bind + ":" + str(port) + ":" + dest : str(port) + ":" + dest
-}
-
 fn route_label(tunnel) {
   if tunnel["kind"] == "socks" {
-    return "SOCKS5 @ relay:" + str(tunnel["remote_bind_port"]) + "  ->  (whole reachable network)"
+    return "SOCKS @ relay:" + str(tunnel["remote_bind_port"]) + "  ->  (whole reachable network)"
   }
   return "relay:" + str(tunnel["remote_bind_port"]) + "  ->  " + tunnel.get("local_host", "localhost") + ":" + str(tunnel.get("local_port", "?"))
 }
@@ -89,39 +86,6 @@ fn primary_socks_port(cfg) {
 fn effective_shell_port(cfg, explicit=0) {
   if explicit > 0 { return explicit }
   return 2200 + (primary_socks_port(cfg) - 1080)
-}
-
-# ---- command construction ----
-
-# capture()/run() shell out via popen(), which on Windows runs the command
-# through cmd.exe, not a POSIX shell - and cmd.exe has no concept of single
-# quotes as a quoting character (they pass through as literal bytes, turning
-# `'ssh'` into a program name that doesn't exist: "'ssh' is not recognized").
-# So quoting has to match whichever shell popen() actually uses on this OS.
-fn _q(s) {
-  let s2 = str(s)
-  if env("OS", "") == "Windows_NT" {
-    if s2.find(" ") < 0 and s2.find("\"") < 0 { return s2 }
-    return "\"" + s2.replace("\"", "\\\"") + "\""
-  }
-  return "'" + s2.replace("'", "'\\''") + "'"
-}
-
-fn build_ssh_command(server, tunnel) {
-  let parts = [
-    _q(server["ssh_exe"]), "-N", "-T",
-    "-p", str(server["port"]),
-    "-i", _q(server["identity"]),
-    "-R", _q(forward_spec(tunnel)),
-    "-o", "BatchMode=yes",
-    "-o", "ExitOnForwardFailure=yes",
-    "-o", "ServerAliveInterval=" + str(server["alive_interval"]),
-    "-o", "ServerAliveCountMax=" + str(server["alive_count_max"]),
-    "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "UserKnownHostsFile=" + _q(server["known_hosts"]),
-    _q(server["user"] + "@" + server["host"])
-  ]
-  return join(parts, " ")
 }
 
 # ---- config persistence ----
@@ -146,39 +110,33 @@ fn config_save(cfg, path) {
   rename(tmp, path)
 }
 
-# ---- error detection (same marker set the real supervisor scans for -
-# ssh -N is silent on success, so failure is detected by what it prints,
-# not by waiting for a nonzero exit that may never come while it's up) ----
+# ---- connecting (shared by tunnel mode and pull/push) ----
 
-let ERROR_MARKERS = [
-  "permission denied", "not accessible", "remote port forwarding failed",
-  "connection refused", "connection timed out", "host key verification failed",
-  "could not resolve", "no route to host"
-]
-
-fn is_error_line(line) {
-  let low = line.lower()
-  for marker in ERROR_MARKERS { if low.find(marker) >= 0 { return true } }
-  return false
+fn _connect_session(server, log_fn) {
+  let session = ssh_open(server["host"], int(server["port"]), 15)
+  let status = ssh.verify_host_trust_on_first_use(session, server.get("known_hosts", "known_hosts"))
+  if status == "unknown" or status == "not_found" {
+    log_fn("trusting new host key for " + server["host"])
+  }
+  let identity = server.get("identity", "").strip()
+  let password = server.get("password", "").strip()
+  if len(identity) > 0 {
+    ssh.authenticate_with_key(session, server["user"], identity)
+  } else if len(password) > 0 {
+    ssh.authenticate_with_password(session, server["user"], password)
+  } else {
+    throw {"type": "ConfigError", "message": "server.identity or server.password must be set"}
+  }
+  return session
 }
 
-# ---- running ----
+# ---- tunnel supervision ----
 
-# One attempt: runs ssh to completion (or until it's killed elsewhere),
-# returns {"output", "had_error", "exit_code"}. Blocks for as long as
-# the tunnel stays up - that's real for a `-N` reverse tunnel, not a bug.
-fn run_once(server, tunnel) {
-  let cmd = build_ssh_command(server, tunnel) + " 2>&1"
-  let output = capture(cmd)
-  let had_error = false
-  for line in output.split("\n") { if is_error_line(line) { had_error = true } }
-  return {"output": output, "had_error": had_error}
-}
-
-# Runs run_once() in a retry loop with exponential backoff (retry_min
-# doubling up to retry_max on each failed attempt, reset after a run
-# that stayed up more than 60s) - same shape as the original supervisor,
-# minus the internal thread (there is none to have). `opts`:
+# Runs one connect-and-forward attempt in a retry loop with exponential
+# backoff (retry_min doubling up to retry_max on each failed attempt,
+# reset after a run that stayed up more than 60s) - same shape as the
+# original shell-out supervisor, minus the internal thread (there is none
+# to have in this language). `opts`:
 #   log_fn(name, line) - called once per real event (connecting/error/
 #     reconnecting), for hooking up your own logging/printing.
 #   sleep_fn(seconds) - injectable, so tests don't really wait.
@@ -193,13 +151,23 @@ fn supervise(server, tunnel, opts={}) {
     attempts = attempts + 1
     log_fn(tunnel["name"], "connecting: " + route_label(tunnel))
     let started = clock()
-    let result = run_once(server, tunnel)
-    let ran_seconds = clock() - started
-    if result["had_error"] {
-      log_fn(tunnel["name"], "error: " + result["output"])
-    } else {
-      log_fn(tunnel["name"], "ssh exited cleanly")
+    let session = nil
+    try {
+      session = _connect_session(server, fn(line) { log_fn(tunnel["name"], line) })
+      let fwd_opts = {"log_fn": fn(line) { log_fn(tunnel["name"], line) }}
+      if tunnel["kind"] == "socks" {
+        ssh.forward_remote_socks(session, tunnel["remote_bind_port"], fwd_opts)
+      } else {
+        ssh.forward_remote_port(session, tunnel["remote_bind_port"],
+          tunnel.get("local_host", "localhost"), tunnel.get("local_port", 22), fwd_opts)
+      }
+    } catch e {
+      log_fn(tunnel["name"], "error: " + str(e))
     }
+    if session != nil {
+      try { ssh_close(session) } catch e2 {}
+    }
+    let ran_seconds = clock() - started
     if ran_seconds > 60 { backoff = server["retry_min"] }
     if max_attempts != nil and attempts >= max_attempts { break }
     log_fn(tunnel["name"], "reconnecting in " + str(backoff) + "s")
@@ -208,4 +176,187 @@ fn supervise(server, tunnel, opts={}) {
     if backoff > server["retry_max"] { backoff = server["retry_max"] }
   }
   return attempts
+}
+
+# ==================== pull / push (direct, no tunnel) ====================
+#
+# If this machine can already reach the server directly, a tunnel isn't
+# needed just to move a file - just an authenticated connection. Built on
+# ssh.run() (real command exec) since the `ssh` package doesn't expose a
+# dedicated SFTP subsystem (Phase 1 is client-exec/forward/socks only,
+# see its README) - so this transfers a file's content base64-encoded
+# through a remote `dd`+`base64` (pull) / `base64 -d`+`dd` (push)
+# pipeline, in fixed-size chunks, each independently retried.
+#
+# Base64, not the raw bytes directly through ssh.run()'s stdout/stderr:
+# those ARE captured byte-safely at the C level (mkstr_n, not strlen) -
+# but everything downstream in this language (concatenation, len(),
+# write_file() on a string) still goes through strlen() sooner or later
+# (see ssh_channel_write()'s own comment, and native/larzscript.c's Str
+# struct - no stored length field at all), so a real embedded 0x00 byte
+# in the file (routine for anything compressed/encrypted/binary) would
+# still get silently dropped the moment this code needed to know "how
+# long is this". Base64 text is pure ASCII - never touches that limitation
+# at all - and gets decoded straight into a byte LIST (real stored count,
+# same representation read_file_bytes()/patch_file_bytes() already use),
+# never reconstructed as a lossy intermediate string. Verified with a
+# real byte list containing 0x00/0xFF/0x01 round-tripping exactly through
+# this exact encode/decode pair before it was wired into file transfer.
+
+let _B64_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+# pull's base64 comes back through the channel's normal DATA stream
+# (ssh_run() reads it in a loop until the channel closes, same as any
+# other command output) - no size limit beyond memory. push's base64
+# goes the OTHER way: embedded directly inside the exec COMMAND string
+# itself (`printf '%s' '<blob>' | base64 -d | dd ...`), which hits real
+# SSH/shell command-length limits - confirmed live: a ~350KB embedded
+# blob (PULL_CHUNK_SIZE-sized) got the whole connection reset by the
+# server. Kept well under any reasonable limit instead of finding the
+# exact ceiling.
+let PULL_CHUNK_SIZE = 262144   # 256KB raw (~350KB base64) per round-trip
+let PUSH_CHUNK_SIZE = 16384    # 16KB raw (~22KB base64) per round-trip
+
+fn _b64_encode_bytes(bytes) {
+  # Builds a LIST of characters and join()s once at the end, not string
+  # concatenation in the loop - found the hard way: `out = out + c` for
+  # every character of a 256KB chunk's ~350KB base64 output hung for
+  # minutes (quadratic - each `+` re-copies the whole string built so
+  # far), while the equivalent decode direction (already list-based, see
+  # _b64_decode_to_bytes below) was fine. A list's push() is amortized
+  # O(1); join() does the final assembly in one pass.
+  let out = []
+  let i = 0
+  let n = len(bytes)
+  while i < n {
+    let b0 = bytes[i]
+    let b1 = i + 1 < n ? bytes[i + 1] : 0
+    let b2 = i + 2 < n ? bytes[i + 2] : 0
+    let triple = b0 * 65536 + b1 * 256 + b2
+    out.push(_B64_ALPHA[(triple // 262144) % 64])
+    out.push(_B64_ALPHA[(triple // 4096) % 64])
+    out.push(i + 1 < n ? _B64_ALPHA[(triple // 64) % 64] : "=")
+    out.push(i + 2 < n ? _B64_ALPHA[triple % 64] : "=")
+    i = i + 3
+  }
+  return join(out, "")
+}
+
+fn _b64_idx(c) {
+  let i = 0
+  while i < 64 { if _B64_ALPHA[i] == c { return i } i = i + 1 }
+  return -1
+}
+
+fn _b64_decode_to_bytes(s) {
+  let out = []
+  let buf = 0
+  let bits = 0
+  for c in s {
+    if c == "=" { break }
+    let v = _b64_idx(c)
+    if v < 0 { continue }
+    buf = buf * 64 + v
+    bits = bits + 6
+    if bits >= 8 {
+      bits = bits - 8
+      let m = int(pow(2, bits))
+      out.push((buf // m) % 256)
+      buf = buf % m
+    }
+  }
+  return out
+}
+
+fn _shq(s) {
+  return "'" + str(s).replace("'", "'\\''") + "'"
+}
+
+fn _retry(fn_body, log_fn, what, attempts=4, base_delay=2) {
+  let i = 0
+  while i < attempts {
+    try {
+      return fn_body()
+    } catch e {
+      i = i + 1
+      if i >= attempts { throw e }
+      let delay = base_delay * int(pow(2, i - 1))
+      log_fn("retry " + str(i) + "/" + str(attempts - 1) + " for " + what + " (" + str(e) + ") - waiting " + str(delay) + "s")
+      sleep(delay)
+    }
+  }
+}
+
+fn _remote_size(session, path) {
+  let r = ssh.run(session, "wc -c < " + _shq(path))
+  if r["exit_status"] != 0 { throw {"type": "SftpError", "message": "could not stat remote file " + path + ": " + r["stderr"]} }
+  return int(r["stdout"].strip())
+}
+
+fn pull(server, remote_path, local_path, opts={}) {
+  let log_fn = opts.has("log_fn") ? opts["log_fn"] : fn(line) { print(line) }
+  let session = _connect_session(server, log_fn)
+  let remote_size = _remote_size(session, remote_path)
+  if file_exists(local_path) and file_size(local_path) == remote_size {
+    log_fn("skip  " + remote_path + " (already have " + str(remote_size) + " bytes)")
+    ssh_close(session)
+    return
+  }
+  log_fn("pull  " + remote_path + " -> " + local_path + "  (" + str(remote_size) + " bytes)")
+  let tmp_path = local_path + ".part"
+  if not file_exists(tmp_path) { write_file(tmp_path, []) }
+  let n_chunks = remote_size > 0 ? ((remote_size + PULL_CHUNK_SIZE - 1) // PULL_CHUNK_SIZE) : 0
+  let i = 0
+  while i < n_chunks {
+    let idx = i
+    _retry(fn() {
+      let cmd = "dd if=" + _shq(remote_path) + " bs=" + str(PULL_CHUNK_SIZE) + " skip=" + str(idx) + " count=1 2>/dev/null | base64 -w0"
+      let r = ssh.run(session, cmd)
+      if r["exit_status"] != 0 { throw {"type": "SftpError", "message": "remote read failed: " + r["stderr"]} }
+      let bytes = _b64_decode_to_bytes(r["stdout"])
+      patch_file_bytes(tmp_path, idx * PULL_CHUNK_SIZE, bytes)
+    }, log_fn, remote_path + " chunk " + str(idx))
+    i = i + 1
+  }
+  rename(tmp_path, local_path)
+  ssh_close(session)
+}
+
+fn _remote_exists_with_size(session, path, want_size) {
+  let r = ssh.run(session, "wc -c < " + _shq(path) + " 2>/dev/null")
+  if r["exit_status"] != 0 { return false }
+  let s = r["stdout"].strip()
+  if len(s) == 0 { return false }
+  return int(s) == want_size
+}
+
+fn push(server, local_path, remote_path, opts={}) {
+  let log_fn = opts.has("log_fn") ? opts["log_fn"] : fn(line) { print(line) }
+  let session = _connect_session(server, log_fn)
+  let local_size = file_size(local_path)
+  if _remote_exists_with_size(session, remote_path, local_size) {
+    log_fn("skip  " + local_path + " (remote already has " + str(local_size) + " bytes)")
+    ssh_close(session)
+    return
+  }
+  log_fn("push  " + local_path + " -> " + remote_path + "  (" + str(local_size) + " bytes)")
+  let tmp_remote = remote_path + ".part"
+  let n_chunks = local_size > 0 ? ((local_size + PUSH_CHUNK_SIZE - 1) // PUSH_CHUNK_SIZE) : 0
+  let i = 0
+  while i < n_chunks {
+    let idx = i
+    let offset = idx * PUSH_CHUNK_SIZE
+    let want = PUSH_CHUNK_SIZE
+    if offset + want > local_size { want = local_size - offset }
+    _retry(fn() {
+      let bytes = read_file_bytes_range(local_path, offset, want)
+      let b64 = _b64_encode_bytes(bytes)
+      let cmd = "printf '%s' " + _shq(b64) + " | base64 -d | dd of=" + _shq(tmp_remote) + " bs=" + str(PUSH_CHUNK_SIZE) + " seek=" + str(idx) + " conv=notrunc 2>/dev/null"
+      let r = ssh.run(session, cmd)
+      if r["exit_status"] != 0 { throw {"type": "SftpError", "message": "remote write failed: " + r["stderr"]} }
+    }, log_fn, local_path + " chunk " + str(idx))
+    i = i + 1
+  }
+  let mv = ssh.run(session, "mv -f " + _shq(tmp_remote) + " " + _shq(remote_path))
+  if mv["exit_status"] != 0 { throw {"type": "SftpError", "message": "could not finalize remote file: " + mv["stderr"]} }
+  ssh_close(session)
 }

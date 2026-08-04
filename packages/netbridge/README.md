@@ -2,7 +2,13 @@
 
 Reverse SSH tunnels through a relay you control - expose a service on a
 machine behind NAT/CGNAT/a firewall, with no inbound port opened on that
-machine. Install: `larzscript pkg install netbridge`.
+machine - plus direct pull/push file transfer for when you don't even
+need a tunnel (see below). Install: `larzscript pkg install netbridge`
+(pulls in the [`ssh`](https://github.com/larz-scripter/larzscript-packages/tree/master/packages/ssh)
+package too - real SSH via libssh bound into the interpreter itself.
+**No external `ssh`/`scp`/`sshpass` binary anywhere**, on any platform
+`ssh` is linked on - see that package's own README for exact platform
+coverage).
 
 ```
 import "netbridge" as netbridge
@@ -12,17 +18,55 @@ srv["host"] = "relay.example.com"
 srv["identity"] = "~/.ssh/netbridge_key"
 let shell = netbridge.tunnel_forward("my-shell", 2200, "127.0.0.1", 22)
 print(netbridge.route_label(shell))
-print(netbridge.build_ssh_command(srv, shell))
 netbridge.supervise(srv, shell, {"log_fn": fn(name, line) { print(line) }})
 ```
 
-Two tunnel kinds, both plain `ssh -R` (no VPN, no extra daemon on the
-relay beyond `sshd`): `tunnel_forward()` (relay:PORT → one service on this
-machine, e.g. its own `sshd`) or `tunnel_socks()` (a reverse dynamic/SOCKS5
-forward - one tunnel reaches your whole reachable network).
-`supervise()` runs a real ssh child, detects failure by scanning for known
-error markers (`ssh -N` is silent on success, so there's no exit code to
-wait on), and reconnects with exponential backoff.
+Two tunnel kinds, both real SSH channel forwarding (no VPN, no extra
+daemon on the relay beyond `sshd`): `tunnel_forward()` (relay:PORT → one
+service on this machine, e.g. its own `sshd` - "log into me through the
+relay") or `tunnel_socks()` (a real SOCKS4/4a/5 proxy on the relay side -
+one tunnel reaches your whole reachable network, not just one port).
+`supervise()` connects, hands off to the `ssh` package's
+`forward_remote_port()`/`forward_remote_socks()` (which block for as
+long as the tunnel stays up, retrying individual bad connections
+internally without dropping the whole tunnel), and reconnects with
+exponential backoff the moment the underlying session actually dies
+(`ssh_is_connected()` - verified live by killing a session mid-tunnel and
+confirming reconnect within about a second, not just assumed).
+
+## pull() / push() - direct file transfer, no tunnel needed at all
+
+If this machine can already reach the relay/server directly (most
+residential/office networks allow *outbound* even when they can't accept
+*inbound* - that's the whole reason tunnels exist in the first place),
+moving a file doesn't need a tunnel, just an authenticated connection:
+
+```
+import "netbridge" as netbridge
+
+let srv = netbridge.default_server()
+srv["host"] = "your-server.example.com"
+srv["identity"] = "~/.ssh/id_ed25519"
+netbridge.pull(srv, "/remote/backup.tar.gz", "backup.tar.gz")
+netbridge.push(srv, "local-file.bin", "/remote/local-file.bin")
+```
+
+Each file transfers in fixed-size chunks over `ssh.run()` (the `ssh`
+package has no dedicated SFTP subsystem yet), independently retried with
+backoff, and skipped entirely if the destination already has a matching
+size - a killed/failed transfer just resumes on re-run rather than
+starting over. Chunk size differs by direction and isn't just a tuning
+knob: `pull()`'s base64 comes back through the channel's normal DATA
+stream (no real size limit), but `push()`'s base64 goes the other way -
+embedded directly in the exec **command string** itself - which hits
+real SSH/shell command-length limits. Found live: a large single chunk
+there got the whole connection reset by the server, not a clean error.
+Binary safety (a real concern - anything compressed/encrypted routinely
+contains `0x00` bytes, which the ordinary string-based path in this
+language silently drops, see the `ssh` package's own notes on this)
+comes from decoding straight into a byte LIST, never reconstructed as a
+string - verified with real files up to 700KB checksummed byte-exact
+end to end, not just small test payloads.
 
 ## One script, one password, done - same file on Linux, macOS, or Windows
 
