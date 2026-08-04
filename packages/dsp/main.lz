@@ -151,6 +151,26 @@ fn biquad_shelf_new(freq_hz, gain_db, sample_rate, high) {
           "x1": 0.0, "x2": 0.0, "y1": 0.0, "y2": 0.0}
 }
 
+# Constant 0dB-peak-gain bandpass (RBJ Audio EQ Cookbook) - isolates a
+# narrow band around freq_hz (bandwidth set by q) instead of shelving
+# everything above/below it. Used as a detector filter (de-essing,
+# sidechain ducking) - process a copy through this to measure how much
+# energy is in one band, without altering the signal that copy came from.
+fn biquad_bandpass_new(freq_hz, q, sample_rate) {
+  let w0 = 2 * PI * freq_hz / sample_rate
+  let cw0 = cos_(w0)
+  let sw0 = sin_(w0)
+  let alpha = sw0 / (2 * q)
+  let b0 = alpha
+  let b1 = 0.0
+  let b2 = -alpha
+  let a0 = 1 + alpha
+  let a1 = -2 * cw0
+  let a2 = 1 - alpha
+  return {"b0": b0 / a0, "b1": b1 / a0, "b2": b2 / a0, "a1": a1 / a0, "a2": a2 / a0,
+          "x1": 0.0, "x2": 0.0, "y1": 0.0, "y2": 0.0}
+}
+
 fn biquad_process(f, x) {
   let y = f["b0"] * x + f["b1"] * f["x1"] + f["b2"] * f["x2"] - f["a1"] * f["y1"] - f["a2"] * f["y2"]
   f["x2"] = f["x1"]; f["x1"] = x
@@ -229,6 +249,68 @@ fn compressor_process(c, x) {
 # never drift from the constants that actually built the LUT.
 fn compressor_process_buffer(c, buf) {
   return _native_compressor_process_buffer(c, buf, _LUT_SIZE, _LUT_MAX_LINEAR)
+}
+
+# ---- noise gate: same dict shape and LUT machinery as the compressor
+# above (lut/attack/release/env), just built with the OPPOSITE transfer
+# curve - unity gain above threshold_db, ratio'd down toward
+# -reduction_db below it, instead of compressing above a threshold. This
+# is why it can reuse compressor_process_buffer/_native_compressor_
+# process_buffer as-is: the native side only ever reads the dict's lut/
+# attack/release/env fields, it doesn't care what curve built the lut. ----
+fn gate_new(threshold_db, reduction_db, attack_ms, release_ms, sample_rate) {
+  let lut = []
+  let i = 0
+  while i < _LUT_SIZE {
+    let env_linear = (i / float(_LUT_SIZE)) * _LUT_MAX_LINEAR
+    let gain = 1.0
+    if env_linear > 0 {
+      let in_db = linear_to_db(env_linear)
+      if in_db < threshold_db {
+        # Linearly ramp the reduction from 0 right at the threshold down
+        # to the full -reduction_db a further 20dB below it, instead of
+        # slamming straight to -reduction_db the instant level dips under
+        # threshold_db - a hard on/off gate audibly chatters on breathy
+        # material; this ramp is what keeps it sounding like "the room
+        # noise got quieter," not a switch flipping.
+        let below = threshold_db - in_db
+        let frac = below / 20.0
+        if frac > 1.0 { frac = 1.0 }
+        gain = db_to_linear(-reduction_db * frac)
+      }
+    }
+    lut.push(gain)
+    i = i + 1
+  }
+  let attack_coeff = _exp(-1.0 / ((attack_ms / 1000.0) * sample_rate))
+  let release_coeff = _exp(-1.0 / ((release_ms / 1000.0) * sample_rate))
+  return {"lut": lut, "attack": attack_coeff, "release": release_coeff, "env": 0.0}
+}
+
+# ---- sidechain processing: the gain applied to `signal` is computed from
+# a SEPARATE `detector` buffer's level, not signal's own - the building
+# block both a de-esser (detector = a bandpass-filtered copy honed in on
+# the sibilant band, signal = the actual dry vocal) and sidechain ducking
+# (detector = the vocal, signal = the beat) are made from. Same lut/
+# attack/release/env dict shape as compressor_new/gate_new - any of the
+# three constructors work here, only the transfer curve differs. ----
+fn sidechain_process_buffer(c, detector, signal) {
+  return _native_sidechain_process_buffer(c, detector, signal, _LUT_SIZE, _LUT_MAX_LINEAR)
+}
+
+# ---- fades + trim detection ----
+
+# Linear gain ramp from start_gain to end_gain across the whole buffer -
+# the standard way to fade a clip in/out without a click at the boundary.
+fn fade_buffer(buf, start_gain, end_gain) {
+  return _native_fade_buffer(buf, start_gain, end_gain)
+}
+
+# Index of the first sample whose absolute value crosses threshold_linear,
+# or len(buf) if the whole buffer stays under it (silent throughout) -
+# the building block for auto-trimming leading silence off a recording.
+fn find_first_above(buf, threshold_linear) {
+  return _native_find_first_above(buf, threshold_linear)
 }
 
 # ---- limiter: a true brickwall is just a linear clamp to the ceiling -
