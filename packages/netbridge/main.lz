@@ -93,7 +93,19 @@ fn effective_shell_port(cfg, explicit=0) {
 
 # ---- command construction ----
 
-fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
+# capture()/run() shell out via popen(), which on Windows runs the command
+# through cmd.exe, not a POSIX shell - and cmd.exe has no concept of single
+# quotes as a quoting character (they pass through as literal bytes, turning
+# `'ssh'` into a program name that doesn't exist: "'ssh' is not recognized").
+# So quoting has to match whichever shell popen() actually uses on this OS.
+fn _q(s) {
+  let s2 = str(s)
+  if env("OS", "") == "Windows_NT" {
+    if s2.find(" ") < 0 and s2.find("\"") < 0 { return s2 }
+    return "\"" + s2.replace("\"", "\\\"") + "\""
+  }
+  return "'" + s2.replace("'", "'\\''") + "'"
+}
 
 fn build_ssh_command(server, tunnel) {
   let parts = [
