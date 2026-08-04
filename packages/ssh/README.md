@@ -34,6 +34,41 @@ ssh.authenticate_with_key(session, "you", "~/.ssh/id_ed25519")
 ssh.forward_remote_port(session, 2200, "127.0.0.1", 22)
 ```
 
+Or the `ssh -R <port>` equivalent with **no fixed destination** - a real
+SOCKS4/4a/5 proxy on the relay's side, so anything THIS machine can reach
+becomes reachable through the tunnel, not just one port:
+
+```
+import "ssh" as ssh
+
+let session = ssh.connect("your-relay.example.com", 22)
+ssh.authenticate_with_key(session, "you", "~/.ssh/id_ed25519")
+
+# relay:1080 is now a real SOCKS proxy - `curl --socks5 relay:1080 ...`
+# reaches anything this machine can reach. Blocks forever.
+ssh.forward_remote_socks(session, 1080)
+```
+
+Hand-rolled in Larzscript (CONNECT-only, SOCKS4/4a/5, all three tested
+against real clients: `curl --socks5`, `--socks5-hostname`, `--socks4`,
+`--socks4a`) on top of the same forwarded-channel mechanism
+`forward_remote_port()` uses - `forward_remote_port()`'s own C-level
+bridge (`ssh_bridge_forward()`) only ever connects to one fixed
+destination, with no hook for Larzscript to inspect a connection's first
+bytes and decide where to send it, which is exactly what a SOCKS
+handshake needs to do. Built on `ssh_accept_forward()` (grabs one
+incoming forwarded connection without auto-bridging it) plus
+byte-list-safe channel/socket I/O (`ssh_channel_read_bytes()`/
+`write_bytes()`, `socket_read_bytes()`/`write_bytes()`) - the ordinary
+string-based `ssh_channel_read()`/`write()` and `socket_read()`/
+`write()` silently drop any real `0x00` byte in the payload (see their
+own doc comments in `native/larzscript.c` - a Larzscript `Str` has no
+stored length at all), which real proxied traffic hits routinely. Same
+connection-isolation guarantee as `forward_remote_port()`: one bad/
+refused/erroring connection never takes the whole tunnel down.
+Verified with a real binary file (500KB of random bytes) fetched through
+the proxy end-to-end - checksums matched exactly.
+
 The server role - this machine answers `ssh user@this-machine cmd` with real
 command output, AND `ssh user@this-machine` (no command) with a real
 interactive login shell - real pty, real job control - no OpenSSH/dropbear/
@@ -141,8 +176,10 @@ throws the documented, catchable `SshError`).
 - **Server-side pubkey auth** - `serve()` only checks passwords for now.
 - **Interactive shell on Windows** - needs ConPTY, see above; exec works
   there today.
-- **Concurrent forwarded connections** - `forward_remote_port()` is one at
-  a time for now, see above.
+- **Concurrent forwarded connections** - `forward_remote_port()` AND
+  `forward_remote_socks()` are both one at a time for now (the latter
+  inherits it directly - it's built on the same `ssh_accept_forward()`
+  primitive), see above.
 - **Window-resize during a live interactive session** - the pty is sized
   correctly at the START of the session (from the client's pty-request),
   but a live terminal resize mid-session isn't propagated yet.

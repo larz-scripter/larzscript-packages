@@ -128,6 +128,229 @@ fn forward_remote_port(session, remote_port, target_host, target_port, opts={}) 
   }
 }
 
+# ==================== reverse SOCKS (dynamic forward) ====================
+#
+# The `ssh -R <port>` equivalent with NO fixed destination - the relay
+# gets a real SOCKS4/4a/5 listener; THIS machine answers each SOCKS
+# handshake itself and opens the requested destination using its OWN
+# network, so anything this machine can reach, the relay can reach
+# through the tunnel. forward_remote_port() above only bridges to one
+# fixed target_host:target_port (entirely in C, via ssh_bridge_forward())
+# - that C function has no hook for Larzscript to inspect a connection's
+# first bytes and decide where to send it, which is exactly what a SOCKS
+# handshake needs. So this is built one level lower, on the raw channel
+# primitives (ssh_accept_forward/ssh_channel_poll/ssh_channel_read_bytes/
+# ssh_channel_write_bytes/ssh_channel_eof/ssh_channel_free) plus the
+# `tcp` package's socket_connect/socket_read_bytes/socket_write_bytes/
+# socket_poll/socket_close for the destination side - the same split
+# paramiko's SOCKS implementation uses (get a raw forwarded-channel
+# callback, hand-roll SOCKS on top).
+#
+# The _bytes builtins, not the plain string ones (ssh_channel_read/write,
+# socket_read/write): a Larzscript Str has no stored length at all - see
+# native/larzscript.c's Str struct and ssh_channel_write()'s own comment
+# - so any real 0x00 byte in the proxied traffic (routine in real binary
+# protocols) gets silently dropped by the ordinary string path the
+# moment anything downstream needs "how long is this". Byte LISTS have a
+# real stored count and don't have that problem - verified with a live
+# test against a real forwarded channel: a payload containing 0x00,
+# 0xFF, 0xFE round-tripped byte-exact in both directions before this was
+# wired into a SOCKS handshake at all.
+
+fn _recv_exact(channel, want, timeout_ms) {
+  let buf = []
+  let waited = 0
+  while len(buf) < want {
+    if ssh_channel_eof(channel) and ssh_channel_poll(channel, 0) == 0 {
+      throw {"type": "SocksError", "message": "channel closed mid-handshake"}
+    }
+    let avail = ssh_channel_poll(channel, 50)
+    if avail > 0 {
+      let chunk = ssh_channel_read_bytes(channel, want - len(buf))
+      for b in chunk { buf.push(b) }
+    } else {
+      waited = waited + 50
+      if waited > timeout_ms { throw {"type": "SocksError", "message": "timed out waiting for handshake data"} }
+    }
+  }
+  return buf
+}
+
+fn _recv_until_null(channel, timeout_ms) {
+  let out = []
+  let waited = 0
+  while true {
+    if ssh_channel_eof(channel) and ssh_channel_poll(channel, 0) == 0 {
+      throw {"type": "SocksError", "message": "channel closed mid-handshake"}
+    }
+    let avail = ssh_channel_poll(channel, 50)
+    if avail > 0 {
+      let b = ssh_channel_read_bytes(channel, 1)
+      if len(b) > 0 {
+        if b[0] == 0 { return out }
+        out.push(b[0])
+      }
+    } else {
+      waited = waited + 50
+      if waited > timeout_ms { throw {"type": "SocksError", "message": "timed out waiting for handshake data"} }
+    }
+  }
+}
+
+fn _bytes_to_ascii(bytes) {
+  let s = ""
+  for b in bytes { s = s + chr(b) }
+  return s
+}
+
+# Relays bytes both directions until either side closes - the live-data
+# phase after a SOCKS handshake completes. Symmetric poll loop, matching
+# ssh_bridge_forward()'s own shape but at the Larzscript level (needed
+# here since the destination is decided per-connection, not fixed).
+fn _socks_bridge(channel, sock) {
+  while true {
+    if ssh_channel_eof(channel) { break }
+    let avail = ssh_channel_poll(channel, 20)
+    if avail > 0 {
+      let data = ssh_channel_read_bytes(channel, avail)
+      if len(data) > 0 { socket_write_bytes(sock, data) }
+    }
+    let ready = socket_poll([sock], 20)
+    if len(ready) > 0 {
+      let data2 = socket_read_bytes(sock, 16384)
+      if len(data2) == 0 { break }
+      ssh_channel_write_bytes(channel, data2)
+    }
+  }
+}
+
+fn _socks5_handshake(channel, timeout_ms) {
+  let nmethods_b = _recv_exact(channel, 1, timeout_ms)
+  let nmethods = nmethods_b[0]
+  _recv_exact(channel, nmethods, timeout_ms)   # method list, ignored - always offer no-auth
+  ssh_channel_write_bytes(channel, [5, 0])      # version 5, method 0 (no auth)
+
+  let head = _recv_exact(channel, 4, timeout_ms)   # ver, cmd, rsv, atyp
+  let cmd = head[1]
+  let atyp = head[3]
+  if cmd != 1 {   # only CONNECT supported
+    ssh_channel_write_bytes(channel, [5, 7, 0, 1, 0, 0, 0, 0, 0, 0])
+    throw {"type": "SocksError", "message": "unsupported SOCKS5 command " + str(cmd)}
+  }
+
+  let host = ""
+  if atyp == 1 {
+    let ip = _recv_exact(channel, 4, timeout_ms)
+    host = str(ip[0]) + "." + str(ip[1]) + "." + str(ip[2]) + "." + str(ip[3])
+  } else if atyp == 3 {
+    let n = _recv_exact(channel, 1, timeout_ms)[0]
+    host = _bytes_to_ascii(_recv_exact(channel, n, timeout_ms))
+  } else if atyp == 4 {
+    let ip6 = _recv_exact(channel, 16, timeout_ms)
+    let parts = []
+    let i = 0
+    while i < 16 {
+      let word = ip6[i] * 256 + ip6[i + 1]
+      parts.push(_hex4(word))
+      i = i + 2
+    }
+    host = join(parts, ":")
+  } else {
+    ssh_channel_write_bytes(channel, [5, 8, 0, 1, 0, 0, 0, 0, 0, 0])
+    throw {"type": "SocksError", "message": "unsupported SOCKS5 address type " + str(atyp)}
+  }
+  let port_b = _recv_exact(channel, 2, timeout_ms)
+  let port = port_b[0] * 256 + port_b[1]
+  return {"host": host, "port": port, "ok_reply": [5, 0, 0, 1, 0, 0, 0, 0, 0, 0], "fail_reply": [5, 5, 0, 1, 0, 0, 0, 0, 0, 0]}
+}
+
+fn _hex4(n) {
+  let digits = "0123456789abcdef"
+  let out = ""
+  let shift = 12
+  while shift >= 0 {
+    out = out + digits[(n // int(pow(2, shift))) % 16]
+    shift = shift - 4
+  }
+  return out
+}
+
+fn _socks4_handshake(channel, first_byte, timeout_ms) {
+  let rest = _recv_exact(channel, 7, timeout_ms)   # cmd(1) + port(2) + ip(4)
+  let cmd = rest[0]
+  let port = rest[1] * 256 + rest[2]
+  let ip = [rest[3], rest[4], rest[5], rest[6]]
+  _recv_until_null(channel, timeout_ms)   # userid, ignored
+  if cmd != 1 {
+    ssh_channel_write_bytes(channel, [0, 91, rest[1], rest[2], rest[3], rest[4], rest[5], rest[6]])   # 91 = SOCKS4 REQUEST REJECTED
+    throw {"type": "SocksError", "message": "unsupported SOCKS4 command " + str(cmd)}
+  }
+  let host = ""
+  if ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] != 0 {
+    # SOCKS4A: 0.0.0.x (x != 0) means "domain name follows"
+    host = _bytes_to_ascii(_recv_until_null(channel, timeout_ms))
+  } else {
+    host = str(ip[0]) + "." + str(ip[1]) + "." + str(ip[2]) + "." + str(ip[3])
+  }
+  let ok_reply = [0, 90, rest[1], rest[2], rest[3], rest[4], rest[5], rest[6]]   # 90 = SOCKS4 REQUEST GRANTED
+  let fail_reply = [0, 91, rest[1], rest[2], rest[3], rest[4], rest[5], rest[6]]   # 91 = SOCKS4 REQUEST REJECTED/FAILED
+  return {"host": host, "port": port, "ok_reply": ok_reply, "fail_reply": fail_reply}
+}
+
+fn _socks_handle_connection(channel, timeout_ms) {
+  let first = _recv_exact(channel, 1, timeout_ms)
+  let ver = first[0]
+  let req = nil
+  if ver == 5 {
+    req = _socks5_handshake(channel, timeout_ms)
+  } else if ver == 4 {
+    req = _socks4_handshake(channel, first[0], timeout_ms)
+  } else {
+    throw {"type": "SocksError", "message": "unrecognized SOCKS version byte " + str(ver)}
+  }
+  let sock = nil
+  try {
+    sock = socket_connect(req["host"], req["port"])
+  } catch e {
+    ssh_channel_write_bytes(channel, req["fail_reply"])
+    throw {"type": "SocksError", "message": "could not connect to " + req["host"] + ":" + str(req["port"]) + " - " + str(e)}
+  }
+  ssh_channel_write_bytes(channel, req["ok_reply"])
+  # No finally in this language - close sock on both the success and
+  # error path explicitly instead of relying on one.
+  try {
+    _socks_bridge(channel, sock)
+  } catch e {
+    socket_close(sock)
+    throw e
+  }
+  socket_close(sock)
+}
+
+# The actual `ssh -R <port>` (no destination) equivalent: relay:remote_port
+# becomes a real SOCKS4/4a/5 listener, and anything this machine can reach
+# becomes reachable through it. Same connection-isolation guarantee as
+# forward_remote_port() - one bad/refused/erroring connection never takes
+# the whole tunnel down.
+fn forward_remote_socks(session, remote_port, opts={}) {
+  let log = opts.has("log_fn") ? opts["log_fn"] : fn(line) { print(line) }
+  let timeout_ms = opts.has("handshake_timeout_ms") ? opts["handshake_timeout_ms"] : 15000
+  ssh_listen_forward(session, remote_port)
+  log("ssh: SOCKS listening on the relay's port " + str(remote_port))
+  while true {
+    let channel = ssh_accept_forward(session, 1000)
+    if channel == nil { continue }
+    log("ssh: SOCKS connection accepted")
+    try {
+      _socks_handle_connection(channel, timeout_ms)
+    } catch e {
+      log("ssh: SOCKS connection error: " + str(e))
+    }
+    ssh_channel_free(channel)
+    log("ssh: SOCKS connection closed")
+  }
+}
+
 # ==================== server role ====================
 #
 # A real SSH server - this machine answers `ssh user@this-machine cmd`
