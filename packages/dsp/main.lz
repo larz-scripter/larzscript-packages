@@ -345,6 +345,43 @@ fn normalize_to(buf, target_dbfs) {
   return _native_scale_buffer(buf, g)
 }
 
+# ---- Phase F polish: saturation, stereo widening, delay/echo send.
+# All three are native (_native_saturate_buffer/_native_stereo_widen/
+# _native_delay_process_buffer) for the same reason biquad_process_buffer
+# above is - a whole multi-minute render running these per-sample in
+# interpreted Larzscript costs real seconds-to-minutes. ----
+
+# Harmonic saturation / soft-clip - tanh-style waveshaping for
+# analog-style warmth. drive > 0; higher = more of the curve's bend used
+# (more perceived saturation), not more output level (the native side
+# normalizes by tanh(drive) so +/-1.0 in stays roughly +/-1.0 out).
+fn saturate_buffer(buf, drive) {
+  return _native_saturate_buffer(buf, drive)
+}
+
+# Stereo widening via mid-side processing. width=1.0 unchanged, >1 wider,
+# <1 narrower, 0 fully mono. Returns {"l":..., "r":...} (both same length
+# as the inputs) rather than mutating in place.
+fn stereo_widen(l, r, width) {
+  return _native_stereo_widen(l, r, width)
+}
+
+# A feedback delay line ("echo") - state is a plain dict the caller owns
+# and threads through calls, same convention every filter/compressor
+# above already uses. delay_ms/feedback/mix are the whole interface:
+# feedback controls how many repeats are audible before they decay away,
+# mix is the wet level summed with the (always-passed-through) dry
+# signal - 0 mix means no audible effect at all, not silence.
+fn delay_new(delay_ms, feedback, mix, sample_rate) {
+  let n = int(delay_ms / 1000.0 * sample_rate)
+  if n < 1 { n = 1 }
+  return {"line": [0.0] * n, "pos": 0.0, "feedback": feedback, "mix": mix}
+}
+
+fn delay_process_buffer(state, buf) {
+  return _native_delay_process_buffer(state, buf)
+}
+
 # ---- synthesis helpers ----
 
 fn noise() { return rng.random() * 2 - 1 }
