@@ -454,3 +454,63 @@ fn resample(samples, from_rate, to_rate) {
   }
   return out
 }
+
+# ---- integrated loudness metering (larzscript-beatstudio PLAN5.md Phase
+# N) - approximates the ITU-R BS.1770 measurement real streaming
+# platforms (Spotify/YouTube/Apple Music) target, NOT a certified/
+# bit-exact implementation. Real K-weighting is two precise filter
+# stages plus a 2-stage RELATIVE gate excluding quiet passages from the
+# measurement; this uses the SAME biquad_shelf_new already in this
+# package to approximate the two K-weighting stages that matter
+# perceptually (a low-end rolloff + a high-frequency presence boost) and
+# a simple ABSOLUTE silence gate instead of the real relative one. Close
+# enough to be a genuinely useful loudness target, not represented as
+# certified-compliant anywhere in this codebase or its UI. ----
+
+fn lufs_new(sample_rate) {
+  return {
+    "hp_l": biquad_shelf_new(60, -8.0, sample_rate, false),
+    "hp_r": biquad_shelf_new(60, -8.0, sample_rate, false),
+    "hf_l": biquad_shelf_new(1500, 4.0, sample_rate, true),
+    "hf_r": biquad_shelf_new(1500, 4.0, sample_rate, true),
+    "sum_sq": 0.0, "count": 0.0,
+  }
+}
+
+# Silence gate threshold - samples quieter than this don't count toward
+# the measurement, a simplified stand-in for BS.1770's real relative
+# gate (which excludes passages quiet RELATIVE to the track's own
+# ungated loudness - this uses one fixed absolute threshold instead).
+let _LUFS_GATE = 0.00003162  # -90 dBFS
+
+fn lufs_process_buffer(state, l, r) {
+  let lw = biquad_process_buffer(state["hp_l"], l)
+  lw = biquad_process_buffer(state["hf_l"], lw)
+  let rw = biquad_process_buffer(state["hp_r"], r)
+  rw = biquad_process_buffer(state["hf_r"], rw)
+  let i = 0
+  while i < len(lw) {
+    let lv = lw[i]
+    let rv = rw[i]
+    if (lv > _LUFS_GATE or lv < -_LUFS_GATE) {
+      state["sum_sq"] = state["sum_sq"] + lv * lv
+      state["count"] = state["count"] + 1.0
+    }
+    if (rv > _LUFS_GATE or rv < -_LUFS_GATE) {
+      state["sum_sq"] = state["sum_sq"] + rv * rv
+      state["count"] = state["count"] + 1.0
+    }
+    i = i + 1
+  }
+}
+
+# -0.691 + 10*log10(mean square) is the real ITU-R BS.1770 formula -
+# 10*log10(x) = linear_to_db(sqrt(x)) since linear_to_db is 20*log10 and
+# sqrt halves the exponent, so this reuses linear_to_db exactly rather
+# than needing a separate log10 helper.
+fn lufs_result(state) {
+  if state["count"] <= 0.0 { return -70.0 }
+  let mean_sq = state["sum_sq"] / state["count"]
+  if mean_sq <= 0.0 { return -70.0 }
+  return -0.691 + linear_to_db(sqrt(mean_sq))
+}
