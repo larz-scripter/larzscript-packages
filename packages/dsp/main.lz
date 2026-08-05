@@ -382,6 +382,47 @@ fn delay_process_buffer(state, buf) {
   return _native_delay_process_buffer(state, buf)
 }
 
+# A real, simplified algorithmic reverb (larzscript-beatstudio PLAN4.md
+# Phase K) - 4 parallel comb filters built directly on delay_new/
+# delay_process_buffer above (no new native code needed - the existing
+# feedback delay line already IS a comb filter, just built for a single
+# echo tap). Delay times (29.7/37.1/41.1/43.7ms) are deliberately
+# mutually-irrational-ish, not round numbers or simple multiples of each
+# other - the classic Schroeder/Freeverb trick for avoiding a metallic/
+# resonant "comb" artifact from delays that share common factors. A
+# real, disclosed simplification vs. a full Freeverb: no per-comb
+# damping (low-pass in the feedback path) or allpass diffusion stage -
+# still 4 genuinely different, overlapping decay tails (a real reverb
+# character), not a single echo repeated.
+fn reverb_new(feedback, mix, sample_rate) {
+  let delays_ms = [29.7, 37.1, 41.1, 43.7]
+  let combs = []
+  for ms in delays_ms { combs.push(delay_new(ms, feedback, 1.0, sample_rate)) }
+  return {"combs": combs, "mix": mix}
+}
+
+# delay_process_buffer's own contract returns dry+wet (x[i]+delayed*mix) -
+# each comb here is built with mix=1.0 internally (see reverb_new), so
+# subtracting the input recovers that comb's pure wet tap; summing the 4
+# recovered wet signals and mixing ONE copy of dry back in avoids
+# quadruple-counting the dry signal the way naively summing 4 raw
+# delay_process_buffer outputs would.
+fn reverb_process_buffer(state, buf) {
+  let n = len(buf)
+  let wet_sum = [0.0] * n
+  for comb in state["combs"] {
+    let out = delay_process_buffer(comb, buf)
+    let i = 0
+    while i < n { wet_sum[i] = wet_sum[i] + (out[i] - buf[i]); i = i + 1 }
+  }
+  let ncombs = float(len(state["combs"]))
+  let mix = state["mix"]
+  let result = [0.0] * n
+  let i = 0
+  while i < n { result[i] = buf[i] + wet_sum[i] / ncombs * mix; i = i + 1 }
+  return result
+}
+
 # ---- synthesis helpers ----
 
 fn noise() { return rng.random() * 2 - 1 }
