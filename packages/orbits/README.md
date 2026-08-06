@@ -23,3 +23,6 @@ for a full showcase app (real rocket-equation propellant costs driving a
 real `wallet`/`pay`/`require` budget), and
 [`neows`](../neows) + [`larzscript-impactwatch`](https://github.com/larz-scripter/larzscript-impactwatch)
 for running these same formulas against NASA's live asteroid-tracking data.
+Try both live, no install needed:
+[larzos.com/rocket-fuel-calculator/](https://larzos.com/rocket-fuel-calculator/)
+and [larzos.com/asteroid-watch/](https://larzos.com/asteroid-watch/).

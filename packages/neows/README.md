@@ -23,4 +23,6 @@ Pairs with [`orbits`](../orbits) - `feed()`'s real diameter and velocity
 figures are exactly the inputs `orbits.kinetic_energy_j()` needs to turn a
 live tracked object into a real impact-energy estimate; see
 [`larzscript-impactwatch`](https://github.com/larz-scripter/larzscript-impactwatch)
-for the full worked example.
+for the full worked example, or try it live at
+[larzos.com/asteroid-watch/](https://larzos.com/asteroid-watch/) - no
+install needed.
