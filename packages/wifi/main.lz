@@ -1,0 +1,278 @@
+# wifi - create a WiFi hotspot (access point) or join a network, using the
+# host OS's own already-working WiFi stack (nmcli/NetworkManager on Linux,
+# netsh on Windows, networksetup on macOS) - not a from-scratch 802.11/WPA
+# reimplementation, the same reasoning behind `ssh` binding libssh instead
+# of hand-rolling SSH: real WiFi security needs the OS's own drivers and
+# crypto stack, which are already correct and already installed.
+#
+# Hosted only (Linux/macOS/Windows) - LarzOS's bare-metal kernel build has
+# no WiFi hardware driver at all yet (only a wired RTL8139 driver - see
+# `net` package's kernel-only note). This package is for Larzscript running
+# ON TOP of a real OS: your laptop, a phone's Linux userland, a Windows box.
+#
+# Requires: nmcli (Linux, ships with NetworkManager - present on virtually
+# every modern desktop/server distro), netsh (Windows, built in),
+# networksetup (macOS, built in - hotspot/Internet Sharing itself has no
+# clean CLI on macOS, see hotspot_start() below).
+#
+# Every function throws a catchable WifiError with a clear message on
+# failure (missing tool, no WiFi hardware, bad SSID/password, permission
+# denied - hotspot creation generally needs to run as root/Administrator).
+#
+#   larzscript pkg install wifi
+#
+#   import "wifi" as wifi
+#   wifi.hotspot_start("MyHotspot", "supersecret123")
+#   for net in wifi.scan() { print(net["ssid"], net["signal"]) }
+#   wifi.connect("HomeWifi", "wifipassword")
+#   print(wifi.status())
+#   wifi.hotspot_stop()
+
+let HOTSPOT_CONN_NAME = "larzscript-hotspot"
+
+fn _is_windows() { return env("OS", "") == "Windows_NT" }
+fn _is_mac() { return not _is_windows() and capture("uname").strip() == "Darwin" }
+fn _is_linux() { return not _is_windows() and not _is_mac() }
+
+fn _fail(msg) { throw {"type": "WifiError", "message": msg} }
+
+fn _which(tool) {
+  # `command -v` is POSIX and works in both bash and sh; on Windows we
+  # check via `where` instead. Empty capture() output means "not found".
+  let cmd = _is_windows() ? "where " + tool + " 2>NUL" : "command -v " + tool + " 2>/dev/null"
+  return capture(cmd).strip() != ""
+}
+
+fn _require_nmcli() {
+  if not _which("nmcli") { _fail("nmcli not found - install NetworkManager (e.g. `apt install network-manager`) or use your distro's native WiFi tool directly; this package only wraps nmcli on Linux") }
+}
+
+# ── Scanning ──────────────────────────────────────────────────────────────
+
+# Returns a list of {"ssid": ..., "signal": <0-100 int>, "security": ...}
+# for networks currently visible to the host's WiFi radio. Requires a real
+# WiFi adapter - on hardware with none (most cloud/server boxes), this
+# returns an empty list rather than throwing, since "no networks visible"
+# and "no radio" look the same from here on Linux/nmcli's own output.
+fn scan() {
+  if _is_linux() {
+    _require_nmcli()
+    run("nmcli dev wifi rescan 2>/dev/null")
+    sleep(1)  # rescan is async; give it a moment before listing
+    let raw = capture("nmcli -t -f SSID,SIGNAL,SECURITY dev wifi list 2>/dev/null")
+    let out = []
+    for line in raw.split("\n") {
+      if line.strip() == "" { continue }
+      let parts = line.split(":")
+      if len(parts) < 3 { continue }
+      if parts[0] == "" { continue }  # hidden/blank SSID entries
+      out.append({"ssid": parts[0], "signal": int(parts[1]), "security": parts[2] == "" ? "open" : parts[2]})
+    }
+    return out
+  }
+  if _is_windows() {
+    let raw = capture("netsh wlan show networks mode=bssid")
+    let out = []
+    let cur_ssid = nil
+    for line in raw.split("\n") {
+      let t = line.strip()
+      if t.starts_with("SSID ") {
+        # "SSID 1 : MyNetwork"
+        let idx = t.find(" : ")
+        cur_ssid = idx == -1 ? "" : t[idx + 3:]
+      } else if t.starts_with("Signal") and cur_ssid != nil {
+        let idx = t.find(":")
+        let sig = idx == -1 ? "0" : t[idx + 1:].strip().replace("%", "")
+        out.append({"ssid": cur_ssid, "signal": int(sig), "security": "unknown"})
+        cur_ssid = nil
+      }
+    }
+    return out
+  }
+  if _is_mac() {
+    _fail("scan() isn't wired up on macOS yet - networksetup has no clean scan-list command; use System Settings > WiFi to see nearby networks for now")
+  }
+  _fail("unsupported platform")
+}
+
+# ── Client mode (join a network) ────────────────────────────────────────
+
+fn connect(ssid, password="") {
+  if _is_linux() {
+    _require_nmcli()
+    let cmd = password == "" ? "nmcli dev wifi connect \"" + ssid + "\"" : "nmcli dev wifi connect \"" + ssid + "\" password \"" + password + "\""
+    let code = run(cmd + " 2>&1")
+    if code != 0 { _fail("failed to connect to \"" + ssid + "\" - check the password, and that nmcli sees the network (try scan() first)") }
+    return true
+  }
+  if _is_windows() {
+    # netsh needs a saved profile to connect by name - no saved profile
+    # exists for a network we've never joined, so build one as a temp XML
+    # file (the documented Windows WLAN profile schema) and add it first.
+    let auth = password == "" ? "open" : "WPA2PSK"
+    let enc = password == "" ? "none" : "AES"
+    let key_block = password == "" ? "" : "<sharedKey><keyType>passPhrase</keyType><protected>false</protected><keyMaterial>" + password + "</keyMaterial></sharedKey>"
+    let xml = "<?xml version=\"1.0\"?><WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\"><name>" + ssid + "</name><SSIDConfig><SSID><name>" + ssid + "</name></SSID></SSIDConfig><connectionType>ESS</connectionType><connectionMode>manual</connectionMode><MSM><security><authEncryption><authentication>" + auth + "</authentication><encryption>" + enc + "</encryption><useOneX>false</useOneX></authEncryption>" + key_block + "</security></MSM></WLANProfile>"
+    let tmp = cwd() + "/.wifi_profile_tmp.xml"
+    write_file(tmp, xml)
+    run("netsh wlan add profile filename=\"" + tmp + "\" 2>&1")
+    remove(tmp)
+    let code = run("netsh wlan connect name=\"" + ssid + "\" ssid=\"" + ssid + "\" 2>&1")
+    if code != 0 { _fail("failed to connect to \"" + ssid + "\" - check the password and that the adapter is enabled") }
+    return true
+  }
+  if _is_mac() {
+    let raw = capture("networksetup -listallhardwareports")
+    let device = nil
+    let seen_wifi_label = false
+    for line in raw.split("\n") {
+      if line.contains("Wi-Fi") or line.contains("AirPort") { seen_wifi_label = true }
+      else if seen_wifi_label and line.starts_with("Device: ") { device = line[8:].strip(); break }
+    }
+    if device == nil { _fail("couldn't find a WiFi hardware device via networksetup -listallhardwareports") }
+    let cmd = "networksetup -setairportnetwork " + device + " \"" + ssid + "\"" + (password == "" ? "" : " \"" + password + "\"")
+    let code = run(cmd + " 2>&1")
+    if code != 0 { _fail("failed to connect to \"" + ssid + "\" on " + device) }
+    return true
+  }
+  _fail("unsupported platform")
+}
+
+fn disconnect() {
+  if _is_linux() {
+    _require_nmcli()
+    let dev = capture("nmcli -t -f DEVICE,TYPE dev status | grep ':wifi$' | head -1 | cut -d: -f1").strip()
+    if dev == "" { _fail("no WiFi device found") }
+    run("nmcli dev disconnect \"" + dev + "\" 2>&1")
+    return true
+  }
+  if _is_windows() { run("netsh wlan disconnect 2>&1"); return true }
+  if _is_mac() { _fail("disconnect() isn't wired up on macOS yet - toggle WiFi off via networksetup -setairportpower <device> off, or use the menu bar") }
+  _fail("unsupported platform")
+}
+
+# {"connected": bool, "ssid": ... or nil, "ip": ... or nil}
+fn status() {
+  if _is_linux() {
+    _require_nmcli()
+    let raw = capture("nmcli -t -f DEVICE,TYPE,STATE,CONNECTION dev status")
+    for line in raw.split("\n") {
+      let parts = line.split(":")
+      if len(parts) < 4 { continue }
+      if parts[1] == "wifi" and parts[2] == "connected" {
+        let ip = capture("nmcli -t -f IP4.ADDRESS dev show \"" + parts[0] + "\" | head -1 | cut -d: -f2 | cut -d/ -f1").strip()
+        return {"connected": true, "ssid": parts[3], "ip": ip == "" ? nil : ip}
+      }
+    }
+    return {"connected": false, "ssid": nil, "ip": nil}
+  }
+  if _is_windows() {
+    let raw = capture("netsh wlan show interfaces")
+    let ssid = nil
+    let connected = false
+    for line in raw.split("\n") {
+      let t = line.strip()
+      if t.starts_with("State") and t.contains("connected") { connected = true }
+      if t.starts_with("SSID") and not t.starts_with("SSID BSSID") {
+        let idx = t.find(":")
+        ssid = idx == -1 ? nil : t[idx + 1:].strip()
+      }
+    }
+    return {"connected": connected, "ssid": connected ? ssid : nil, "ip": nil}
+  }
+  if _is_mac() {
+    let raw = capture("networksetup -getairportnetwork en0 2>/dev/null")
+    if raw.contains("Current Wi-Fi Network: ") {
+      return {"connected": true, "ssid": raw.split(": ")[1].strip(), "ip": nil}
+    }
+    return {"connected": false, "ssid": nil, "ip": nil}
+  }
+  _fail("unsupported platform")
+}
+
+# ── Hotspot / access-point mode ─────────────────────────────────────────
+
+# Starts a WiFi hotspot other devices can join, broadcasting `ssid` secured
+# with WPA2-PSK `password` (8-63 chars, per the WPA2 spec - the OS's own
+# tooling enforces this and throws if it's out of range). Generally needs
+# root/Administrator - run the Larzscript process elevated.
+#
+# `interface`: which WiFi adapter to use for the hotspot. On Linux, if nil,
+# picks the first WiFi device nmcli reports. Not all adapters support AP
+# (master) mode - check `iw list` (look for "AP" under "Supported
+# interface modes") if this throws with a driver/mode error.
+fn hotspot_start(ssid, password, interface=nil) {
+  if len(password) < 8 { _fail("WPA2 requires a password of at least 8 characters") }
+  if _is_linux() {
+    _require_nmcli()
+    let iface = interface
+    if iface == nil {
+      iface = capture("nmcli -t -f DEVICE,TYPE dev status | grep ':wifi$' | head -1 | cut -d: -f1").strip()
+      if iface == "" { _fail("no WiFi device found - is a WiFi adapter present and enabled? (`nmcli dev status` to check)") }
+    }
+    # Explicit connection profile (rather than the `nmcli dev wifi hotspot`
+    # shorthand) so we have a stable, named connection to bring down and
+    # delete later - the shorthand's auto-generated name isn't guaranteed
+    # across NetworkManager versions.
+    run("nmcli connection delete \"" + HOTSPOT_CONN_NAME + "\" 2>/dev/null")  # clean up any stale profile from a prior run
+    let add_code = run("nmcli connection add type wifi ifname \"" + iface + "\" con-name \"" + HOTSPOT_CONN_NAME + "\" autoconnect no ssid \"" + ssid + "\" 2>&1")
+    if add_code != 0 { _fail("failed to create hotspot connection profile on " + iface) }
+    run("nmcli connection modify \"" + HOTSPOT_CONN_NAME + "\" 802-11-wireless.mode ap 802-11-wireless.band bg ipv4.method shared wifi-sec.key-mgmt wpa-psk wifi-sec.psk \"" + password + "\" 2>&1")
+    let up_code = run("nmcli connection up \"" + HOTSPOT_CONN_NAME + "\" 2>&1")
+    if up_code != 0 { _fail("failed to activate the hotspot on " + iface + " - check that the adapter supports AP mode (`iw list`) and that you're running as root/Administrator") }
+    return true
+  }
+  if _is_windows() {
+    run("netsh wlan set hostednetwork mode=allow ssid=\"" + ssid + "\" key=\"" + password + "\" 2>&1")
+    let code = run("netsh wlan start hostednetwork 2>&1")
+    if code != 0 { _fail("failed to start the hosted network - this needs the adapter driver to support \"Virtual WiFi\" (check with `netsh wlan show drivers`, look for \"Hosted network supported: Yes\"), and an elevated (Administrator) prompt") }
+    return true
+  }
+  if _is_mac() {
+    _fail("macOS Internet Sharing has no reliable command-line control - enable it manually via System Settings > General > Sharing > Internet Sharing, sharing your connection over Wi-Fi")
+  }
+  _fail("unsupported platform")
+}
+
+fn hotspot_stop() {
+  if _is_linux() {
+    _require_nmcli()
+    run("nmcli connection down \"" + HOTSPOT_CONN_NAME + "\" 2>&1")
+    run("nmcli connection delete \"" + HOTSPOT_CONN_NAME + "\" 2>&1")
+    return true
+  }
+  if _is_windows() { run("netsh wlan stop hostednetwork 2>&1"); return true }
+  if _is_mac() { _fail("stop Internet Sharing manually via System Settings > General > Sharing") }
+  _fail("unsupported platform")
+}
+
+# {"active": bool, "ssid": ... or nil, "clients": <connected device count, Linux only>}
+fn hotspot_status() {
+  if _is_linux() {
+    _require_nmcli()
+    let raw = capture("nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null")
+    for line in raw.split("\n") {
+      let parts = line.split(":")
+      if len(parts) >= 1 and parts[0] == HOTSPOT_CONN_NAME {
+        let ssid = capture("nmcli -t -f 802-11-wireless.ssid connection show \"" + HOTSPOT_CONN_NAME + "\" | cut -d: -f2").strip()
+        return {"active": true, "ssid": ssid, "clients": nil}
+      }
+    }
+    return {"active": false, "ssid": nil, "clients": nil}
+  }
+  if _is_windows() {
+    let raw = capture("netsh wlan show hostednetwork")
+    let active = raw.contains("Status") and raw.contains("Started")
+    let ssid = nil
+    for line in raw.split("\n") {
+      let t = line.strip()
+      if t.starts_with("SSID name") {
+        let idx = t.find(":")
+        ssid = idx == -1 ? nil : t[idx + 1:].strip().replace("\"", "")
+      }
+    }
+    return {"active": active, "ssid": active ? ssid : nil, "clients": nil}
+  }
+  if _is_mac() { _fail("hotspot_status() isn't available on macOS - Internet Sharing state isn't exposed via any CLI") }
+  _fail("unsupported platform")
+}
