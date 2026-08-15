@@ -172,7 +172,10 @@ fn status() {
     let connected = false
     for line in raw.split("\n") {
       let t = line.strip()
-      if t.starts_with("State") and t.contains("connected") { connected = true }
+      if t.starts_with("State") {
+        let sidx = t.find(":")
+        if sidx != -1 and t[sidx + 1:].strip() == "connected" { connected = true }
+      }
       if t.starts_with("SSID") and not t.starts_with("SSID BSSID") {
         let idx = t.find(":")
         ssid = idx == -1 ? nil : t[idx + 1:].strip()
@@ -224,8 +227,12 @@ fn hotspot_start(ssid, password, interface=nil) {
   }
   if _is_windows() {
     run("netsh wlan set hostednetwork mode=allow ssid=\"" + ssid + "\" key=\"" + password + "\" 2>&1")
-    let code = run("netsh wlan start hostednetwork 2>&1")
-    if code != 0 { _fail("failed to start the hosted network - this needs the adapter driver to support \"Virtual WiFi\" (check with `netsh wlan show drivers`, look for \"Hosted network supported: Yes\"), and an elevated (Administrator) prompt") }
+    # netsh's own process exit code is unreliable here - confirmed live on real
+    # hardware that it returns 0 even when the hosted network fails to actually
+    # start, so success/failure has to be read from the command's own text
+    # output instead of trusting the exit code.
+    let out = capture("netsh wlan start hostednetwork 2>&1")
+    if out.contains("couldn't be started") or not out.contains("started") { _fail("failed to start the hosted network (" + out.strip().replace("\n", " ") + ") - this needs the adapter driver to support \"Virtual WiFi\" (check with `netsh wlan show drivers`, look for \"Hosted network supported: Yes\"), and an elevated (Administrator) prompt") }
     return true
   }
   if _is_mac() {

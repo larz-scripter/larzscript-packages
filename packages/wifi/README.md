@@ -48,8 +48,18 @@ and `netsh`'s multi-line output, using realistic sample data. The
 tool-missing/no-hardware failure path was verified live (a real machine
 with no `nmcli` installed throws the expected `WifiError`).
 
+`scan()`, `status()`, and `hotspot_start()`'s failure path were also
+verified live on a real Windows 10 machine with real WiFi hardware. This
+run caught and fixed two real bugs: `status()` was matching "connected" as
+a substring of "disconnected" and always reporting `connected: true`; and
+`hotspot_start()` on Windows was trusting `netsh`'s process exit code,
+which returns 0 even when the hosted network genuinely fails to start —
+it now parses the command's own text output instead.
+
 **Not yet verified**: an actual hotspot broadcasting and a real device
-joining it, on real WiFi hardware — the machines used to build this had no
-wireless radio and no permission to install network-management software.
-If you hit something that doesn't work as documented, please open an issue
-with your OS, WiFi adapter, and the exact error.
+joining it. The real hardware used above doesn't support the legacy
+"hosted network" mechanism at all ("Hosted network supported: No" per
+`netsh wlan show drivers`), so `hotspot_start()`'s happy path — and the
+Linux/macOS hotspot paths generally — remain unverified on real WiFi
+hardware. If you hit something that doesn't work as documented, please
+open an issue with your OS, WiFi adapter, and the exact error.
