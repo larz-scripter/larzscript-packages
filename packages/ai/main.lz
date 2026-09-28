@@ -1,44 +1,76 @@
-# ai - a generic, pluggable LLM HTTP client for Larzscript (hosted/native
-# only - needs curl, doesn't run on the bare-metal kernel, same tier as the
-# `http` package it's built on). No endpoint/key is ever hardcoded - point
-# it at your own gateway or any OpenAI-compatible endpoint via env vars:
-#   LARZSCRIPT_AI_URL    - full chat-completions endpoint URL
-#   LARZSCRIPT_AI_KEY    - bearer/API key (sent as "Authorization: Bearer ...")
-#   LARZSCRIPT_AI_MODEL  - model name (optional, default "gpt-4o-mini")
-# Default request/response shape is OpenAI-style chat completions
-# (POST {model, messages:[{role,content}]} -> {choices:[{message:{content}}]})
-# - the most common shape gateways speak.
+# ai - call any OpenAI-compatible chat completion endpoint, in pure
+# Larzscript. Built on the json package for parsing/encoding. Doesn't use
+# the http package's post_headers() on purpose: it shells out with
+# `curl -f`, which discards the response body on any 4xx/5xx status - and
+# OpenAI-compatible APIs put the actually-useful error message in that
+# body (see the "endpoint returned an error" path below), so this needs
+# the body regardless of status code. Uses the same proven single-quote
+# shell-escaping http.lz's own _q() uses (wrap in quotes, close/escape/
+# reopen for any embedded quote) rather than depending on that package's
+# private helper.
+#
+# No endpoint, model or key is ever hardcoded - configure via environment
+# variables so this works with any real OpenAI-compatible backend (the
+# real OpenAI API, Azure OpenAI, a self-hosted gateway, local Ollama via
+# an OpenAI-compatible shim, ...), not one estate's private infrastructure:
+#   LARZSCRIPT_AI_ENDPOINT   full URL to a /v1/chat/completions-style route
+#   LARZSCRIPT_AI_MODEL      model name your endpoint expects
+#   LARZSCRIPT_AI_KEY        optional - sent as "Authorization: Bearer ..."
+#                            when set; omit for an endpoint that needs none
 #
 #   import "ai" as ai
-#   print(ai.ask("summarize: the quick brown fox jumps over the lazy dog"))
+#   let answer = ai.ask("What is 2 + 2? Answer with just the number.")
+#   print(answer)
 #
-# THE MONEY-NATIVE PART - an AI call as a real metered transaction, not just
-# an API wrapper: ask_paid() pays from the caller's wallet BEFORE calling
-# out, using this language's own `pay`/`wallet` keywords, so a declined
-# payment means the call never happens.
-#   wallet user = $5.00
-#   wallet api_revenue
-#   price per_call = $0.02
-#   print(ai.ask_paid("hello", user, api_revenue, per_call))
+# ask_with(prompt, endpoint, model, key) skips the environment entirely,
+# for a script that talks to more than one endpoint or shouldn't read env.
+#
+# Errors raise AiError with a clear message: missing config, no response,
+# an endpoint-reported error (with the endpoint's own real message), or a
+# response shape ask() doesn't recognize (never a silent empty string).
 
-import "http" as http
 import "json" as json
 
+fn _q(s) { return "'" + str(s).replace("'", "'\\''") + "'" }
+
 fn ask(prompt) {
-  let url = env("LARZSCRIPT_AI_URL", "")
-  if url == "" {
-    throw {"type": "AiError", "message": "set LARZSCRIPT_AI_URL (and LARZSCRIPT_AI_KEY) first"}
-  }
-  let key = env("LARZSCRIPT_AI_KEY", "")
-  let model = env("LARZSCRIPT_AI_MODEL", "gpt-4o-mini")
-  let body = json.stringify({"model": model, "messages": [{"role": "user", "content": prompt}]})
-  let headers = {"Content-Type": "application/json"}
-  if key != "" { headers["Authorization"] = "Bearer " + key }
-  let data = json.parse(http.post_headers(url, body, headers))
-  return data["choices"][0]["message"]["content"]
+  return ask_with(prompt, env("LARZSCRIPT_AI_ENDPOINT"), env("LARZSCRIPT_AI_MODEL"), env("LARZSCRIPT_AI_KEY"))
 }
 
-fn ask_paid(prompt, wallet_from, wallet_to, unit_price) {
-  pay unit_price from wallet_from to wallet_to
-  return ask(prompt)
+fn ask_with(prompt, endpoint, model, key) {
+  if endpoint == nil or endpoint == "" {
+    throw {"type": "AiError", "message": "no endpoint configured - set LARZSCRIPT_AI_ENDPOINT (a /v1/chat/completions-style URL) or pass one to ask_with()"}
+  }
+  if model == nil or model == "" {
+    throw {"type": "AiError", "message": "no model configured - set LARZSCRIPT_AI_MODEL or pass one to ask_with()"}
+  }
+
+  let body = json.stringify({"model": model, "messages": [{"role": "user", "content": prompt}]})
+  let auth_flag = ""
+  if key != nil and key != "" { auth_flag = " -H " + _q("Authorization: Bearer " + key) }
+
+  let cmd = "curl -sS -X POST " + _q(endpoint) + " -H " + _q("Content-Type: application/json") + auth_flag + " --data " + _q(body)
+  let out = capture(cmd)
+
+  if out == nil or out.strip() == "" {
+    throw {"type": "AiError", "message": "no response from endpoint (curl produced no output) - check LARZSCRIPT_AI_ENDPOINT and network access"}
+  }
+
+  let data = json.parse(out)
+
+  let err_msg = json.get(data, "error.message", nil)
+  if err_msg != nil {
+    throw {"type": "AiError", "message": "endpoint returned an error: " + err_msg}
+  }
+
+  let choices = json.get(data, "choices", nil)
+  if choices == nil or len(choices) == 0 {
+    throw {"type": "AiError", "message": "unrecognized response shape (no .choices) from endpoint: " + out}
+  }
+
+  let content = json.get(choices[0], "message.content", nil)
+  if content == nil {
+    throw {"type": "AiError", "message": "unrecognized response shape (no .choices[0].message.content) from endpoint: " + out}
+  }
+  return content
 }
