@@ -25,7 +25,11 @@ fn _copy(v) {
 fn open(path=nil) {
   let records = {}
   let next_id = 1
-  if path != nil and file_exists(path) {
+  # A path that exists but is empty (e.g. pre-created by `touch` or
+  # `mktemp`, or left behind by a process that crashed before its
+  # first save()) is treated the same as a path that doesn't exist
+  # yet, not as invalid JSON.
+  if path != nil and file_exists(path) and len(read_file(path)) > 0 {
     let loaded = json.parse(read_file(path))
     records = loaded["records"]
     next_id = loaded["next_id"]
